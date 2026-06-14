@@ -29,19 +29,23 @@ export type EvaluationItem = {
 }
 
 export type Evaluation = {
+  status: 'ok' | 'failed'
   score: number
   items: EvaluationItem[]
   criticalFailures: string[]
   summary: string
+  error?: string
 }
 
 export type PromptRun = {
   id: string
+  status: 'completed' | 'output_failed' | 'evaluation_failed'
   inputIndex: number
   input: string
   output: string
   metrics: AutoMetrics
   evaluation: Evaluation
+  error?: string
 }
 
 export type PromptResult = {
@@ -51,6 +55,8 @@ export type PromptResult = {
   averageScore: number
   minScore: number
   maxScore: number
+  completedRuns: number
+  failedRuns: number
   criticalFailures: number
   bestOutput: string
   worstOutput: string

@@ -226,6 +226,26 @@ textarea:focus {
   margin-top: 8px;
 }
 
+.key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.key-loaded,
+.key-empty {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.key-loaded {
+  color: var(--success);
+}
+
 .input-item textarea {
   padding-right: 42px;
 }
@@ -270,6 +290,12 @@ textarea:focus {
   min-height: 38px;
   padding: 0 12px;
   border: 1px solid transparent;
+}
+
+.secondary-button.compact {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 0.78rem;
 }
 
 .primary-button {

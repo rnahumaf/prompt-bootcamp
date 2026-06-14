@@ -15,6 +15,8 @@ const ChatSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(12000).optional(),
   jsonMode: z.boolean().optional(),
+  label: z.string().max(120).optional(),
+  attempt: z.number().int().min(1).max(10).optional(),
 })
 
 const app = express()
@@ -33,7 +35,7 @@ app.post('/api/openrouter/chat', async (request, response) => {
     return
   }
 
-  const { apiKey, model, messages, temperature = 0.35, maxTokens = 1800, jsonMode = false } = parsed.data
+  const { apiKey, model, messages, temperature = 0.35, maxTokens = 1800, jsonMode = false, label = 'chamada' } = parsed.data
 
   try {
     const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -55,29 +57,46 @@ app.post('/api/openrouter/chat', async (request, response) => {
 
     const payload = (await upstream.json().catch(() => null)) as
       | {
-          choices?: Array<{ message?: { content?: string } }>
+          choices?: Array<{ finish_reason?: string; message?: { content?: string | Array<{ type?: string; text?: string }> } }>
           error?: { message?: string }
+          provider?: string
         }
       | null
 
     if (!upstream.ok) {
       response.status(upstream.status).json({
-        error: payload?.error?.message ?? `OpenRouter retornou HTTP ${upstream.status}.`,
+        error: `${label}: ${payload?.error?.message ?? `OpenRouter retornou HTTP ${upstream.status}.`}`,
+        retryable: upstream.status === 429 || upstream.status >= 500,
       })
       return
     }
 
-    const content = payload?.choices?.[0]?.message?.content
+    const messageContent = payload?.choices?.[0]?.message?.content
+    const content = Array.isArray(messageContent)
+      ? messageContent
+          .map((part) => part.text ?? '')
+          .join('')
+          .trim()
+      : messageContent?.trim()
 
     if (!content) {
-      response.status(502).json({ error: 'OpenRouter retornou uma resposta sem conteúdo.' })
+      response.status(502).json({
+        error: `${label}: OpenRouter retornou uma resposta sem conteúdo.`,
+        retryable: true,
+        details: {
+          choices: payload?.choices?.length ?? 0,
+          finishReason: payload?.choices?.[0]?.finish_reason ?? null,
+          provider: payload?.provider ?? null,
+        },
+      })
       return
     }
 
     response.json({ content })
   } catch (error) {
     response.status(502).json({
-      error: error instanceof Error ? error.message : 'Falha desconhecida ao chamar a OpenRouter.',
+      error: `${label}: ${error instanceof Error ? error.message : 'Falha desconhecida ao chamar a OpenRouter.'}`,
+      retryable: true,
     })
   }
 })

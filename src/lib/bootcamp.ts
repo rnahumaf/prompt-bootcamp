@@ -1,7 +1,7 @@
 import { diffLines } from 'diff'
 import { callOpenRouter } from './openrouter'
 import { parseJsonObject } from './json'
-import { collectAutoMetrics, summarizeMetrics } from './metrics'
+import { collectAutoMetrics, emptyAutoMetrics, summarizeMetrics } from './metrics'
 import type { BootcampConfig, Candidate, Evaluation, PromptResult, PromptRun } from '../types'
 import { RUNS_PER_PROMPT } from '../types'
 
@@ -57,6 +57,7 @@ export async function createInitialPrompt(runtime: Runtime, signal?: AbortSignal
     temperature: 0.25,
     maxTokens: 2200,
     jsonMode: true,
+    label: 'criador: prompt inicial',
     signal,
     messages: [
       {
@@ -109,6 +110,7 @@ export async function createCandidatePrompt(
     temperature: 0.45,
     maxTokens: 2800,
     jsonMode: true,
+    label: 'criador: candidato',
     signal,
     messages: [
       {
@@ -184,50 +186,83 @@ export async function runPromptEvaluation(
 
     const inputIndex = index % runtime.inputs.length
     const input = runtime.inputs[inputIndex]
-    const output = await callOpenRouter({
-      apiKey: runtime.apiKey,
-      model: runtime.model,
-      temperature: 0.2,
-      maxTokens: 1800,
-      signal,
-      messages: [
-        {
-          role: 'system',
-          content: prompt,
-        },
-        {
-          role: 'user',
-          content: input,
-        },
-      ],
-    })
 
-    const metrics = collectAutoMetrics(output)
-    const evaluation = await evaluateOutput(runtime, input, output, metrics, signal)
-    const run: PromptRun = {
-      id: safeId('run'),
-      inputIndex,
-      input,
-      output,
-      metrics,
-      evaluation,
+    let run: PromptRun
+
+    try {
+      const output = await callOpenRouter({
+        apiKey: runtime.apiKey,
+        model: runtime.model,
+        temperature: 0.2,
+        maxTokens: 1800,
+        label: `${label}: execução ${index + 1}`,
+        signal,
+        messages: [
+          {
+            role: 'system',
+            content: prompt,
+          },
+          {
+            role: 'user',
+            content: input,
+          },
+        ],
+      })
+
+      const metrics = collectAutoMetrics(output)
+      const evaluation = await evaluateOutput(runtime, input, output, metrics, index + 1, signal)
+      run = {
+        id: safeId('run'),
+        status: evaluation.status === 'ok' ? 'completed' : 'evaluation_failed',
+        inputIndex,
+        input,
+        output,
+        metrics,
+        evaluation,
+        error: evaluation.error,
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Falha desconhecida ao gerar output.'
+      run = {
+        id: safeId('run'),
+        status: 'output_failed',
+        inputIndex,
+        input,
+        output: '',
+        metrics: emptyAutoMetrics(),
+        evaluation: {
+          status: 'failed',
+          score: 0,
+          items: [],
+          criticalFailures: [],
+          summary: 'Falha operacional ao gerar output; este run não entra na média.',
+          error: message,
+        },
+        error: message,
+      }
     }
+
     runs.push(run)
     onRun?.(run)
   }
 
-  const scores = runs.map((run) => run.evaluation.score)
-  const averageScore = Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 10) / 10
-  const sorted = [...runs].sort((a, b) => a.evaluation.score - b.evaluation.score)
+  const scoredRuns = runs.filter((run) => run.status === 'completed' && run.evaluation.status === 'ok')
+  const scores = scoredRuns.map((run) => run.evaluation.score)
+  const averageScore = scores.length
+    ? Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 10) / 10
+    : 0
+  const sorted = [...scoredRuns].sort((a, b) => a.evaluation.score - b.evaluation.score)
 
   return {
     id: safeId('result'),
     label,
     prompt,
     averageScore,
-    minScore: Math.min(...scores),
-    maxScore: Math.max(...scores),
-    criticalFailures: runs.reduce((sum, run) => sum + run.evaluation.criticalFailures.length, 0),
+    minScore: scores.length ? Math.min(...scores) : 0,
+    maxScore: scores.length ? Math.max(...scores) : 0,
+    completedRuns: scoredRuns.length,
+    failedRuns: runs.length - scoredRuns.length,
+    criticalFailures: scoredRuns.reduce((sum, run) => sum + run.evaluation.criticalFailures.length, 0),
     bestOutput: sorted.at(-1)?.output ?? '',
     worstOutput: sorted[0]?.output ?? '',
     runs,
@@ -239,24 +274,18 @@ async function evaluateOutput(
   input: string,
   output: string,
   metrics: ReturnType<typeof collectAutoMetrics>,
+  runNumber: number,
   signal?: AbortSignal,
 ): Promise<Evaluation> {
-  const content = await callOpenRouter({
-    apiKey: runtime.apiKey,
-    model: runtime.model,
-    temperature: 0,
-    maxTokens: 1600,
-    jsonMode: true,
-    signal,
-    messages: [
-      {
-        role: 'system',
-        content:
-          'Você é o AVALIADOR. Avalie um único output sem saber se ele veio do prompt antigo ou novo. Use os critérios fornecidos, não invente critérios. Responda somente JSON válido.',
-      },
-      {
-        role: 'user',
-        content: `Critérios de avaliação:
+  const messages = [
+    {
+      role: 'system' as const,
+      content:
+        'Você é o AVALIADOR. Avalie um único output sem saber se ele veio do prompt antigo ou novo. Use os critérios fornecidos, não invente critérios. Responda somente JSON válido.',
+    },
+    {
+      role: 'user' as const,
+      content: `Critérios de avaliação:
 ${runtime.evaluationCriteria}
 
 Input original:
@@ -286,26 +315,85 @@ Responda neste JSON:
   "criticalFailures": ["falhas críticas, se houver"],
   "summary": "resumo curto"
 }`,
+    },
+  ]
+
+  try {
+    const content = await callOpenRouter({
+      apiKey: runtime.apiKey,
+      model: runtime.model,
+      temperature: 0,
+      maxTokens: 1600,
+      jsonMode: true,
+      label: `avaliador: run ${runNumber}`,
+      signal,
+      messages,
+    })
+
+    const parsed = parseJsonObject<EvaluationPayload>(content)
+    return normalizeEvaluation(parsed)
+  } catch (error) {
+    const firstError = error instanceof Error ? error.message : 'Falha desconhecida do avaliador.'
+
+    try {
+      const repaired = await repairEvaluation(runtime, messages.at(-1)?.content ?? '', firstError, signal)
+      return normalizeEvaluation(parseJsonObject<EvaluationPayload>(repaired))
+    } catch (repairError) {
+      const repairMessage = repairError instanceof Error ? repairError.message : 'Falha desconhecida ao reparar avaliação.'
+
+      return {
+        status: 'failed',
+        score: 0,
+        items: [],
+        criticalFailures: [],
+        summary: 'Falha operacional do avaliador; este run não entra na média.',
+        error: `${firstError}; reparo falhou: ${repairMessage}`,
+      }
+    }
+  }
+}
+
+function normalizeEvaluation(parsed: EvaluationPayload): Evaluation {
+  const score = Number(parsed.score)
+
+  return {
+    status: 'ok',
+    score: Number.isFinite(score) ? Math.max(0, Math.min(10, score)) : 0,
+    items: Array.isArray(parsed.items) ? parsed.items : [],
+    criticalFailures: Array.isArray(parsed.criticalFailures) ? parsed.criticalFailures : [],
+    summary: parsed.summary || 'Avaliação concluída.',
+  }
+}
+
+async function repairEvaluation(
+  runtime: Runtime,
+  originalPrompt: string,
+  errorMessage: string,
+  signal?: AbortSignal,
+) {
+  return callOpenRouter({
+    apiKey: runtime.apiKey,
+    model: runtime.model,
+    temperature: 0,
+    maxTokens: 1200,
+    jsonMode: false,
+    label: 'avaliador: reparo JSON',
+    signal,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Você repara respostas de avaliação para JSON estrito. Não reavalie o caso. Responda somente um objeto JSON válido.',
+      },
+      {
+        role: 'user',
+        content: `A avaliação anterior falhou com este erro:
+${errorMessage}
+
+Reexecute a avaliação abaixo e responda somente no JSON solicitado, sem markdown:
+
+${originalPrompt}`,
       },
     ],
   })
-
-  try {
-    const parsed = parseJsonObject<EvaluationPayload>(content)
-    const score = Number(parsed.score)
-
-    return {
-      score: Number.isFinite(score) ? Math.max(0, Math.min(10, score)) : 0,
-      items: Array.isArray(parsed.items) ? parsed.items : [],
-      criticalFailures: Array.isArray(parsed.criticalFailures) ? parsed.criticalFailures : [],
-      summary: parsed.summary || 'Avaliação concluída.',
-    }
-  } catch (error) {
-    return {
-      score: 0,
-      items: [],
-      criticalFailures: [`JSON inválido do avaliador: ${(error as Error).message}`],
-      summary: 'A avaliação falhou por formato inválido.',
-    }
-  }
 }

@@ -24,6 +24,7 @@ O campo é editável caso o ID do modelo na OpenRouter precise de ajuste.
 ## Segurança da chave
 
 - A chave é digitada na UI e enviada apenas ao proxy local em `http://127.0.0.1:8787`.
+- Depois de clicar em `Usar chave`, o campo é limpo e a chave fica apenas em memória durante a sessão.
 - O servidor local repassa a chamada para `https://openrouter.ai/api/v1/chat/completions`.
 - A chave não é salva por padrão em arquivo, banco ou `localStorage`.
 
@@ -36,6 +37,8 @@ O campo é editável caso o ID do modelo na OpenRouter precise de ajuste.
 5. O candidato é executado 10 vezes.
 6. Se a média superar o melhor prompt atual, o sistema pausa e mostra o diff visual.
 7. Se três candidatos consecutivos não melhorarem a nota, a sessão é encerrada.
+
+Falhas operacionais de API ou de parsing do avaliador não entram na média do prompt. O app tenta retries e reparo de JSON antes de marcar um run como falho.
 
 ## Scripts
 

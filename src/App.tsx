@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  X,
 } from 'lucide-react'
 import './App.css'
 import {
@@ -62,7 +63,9 @@ function scoreClass(score?: number) {
 }
 
 function App() {
-  const [apiKey, setApiKey] = useState('')
+  const apiKeyRef = useRef('')
+  const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [hasApiKey, setHasApiKey] = useState(false)
   const [model, setModel] = useState(DEFAULT_MODEL)
   const [seedPrompt, setSeedPrompt] = useState('')
   const [taskInstructions, setTaskInstructions] = useState(starterTask)
@@ -86,13 +89,36 @@ function App() {
   const canSend = status === 'paused' || status === 'stopped' || status === 'done'
 
   const cleanInputs = useMemo(() => inputs.map((input) => input.trim()).filter(Boolean), [inputs])
+  const currentFailedRuns = currentRuns.filter((run) => run.status !== 'completed').length
 
   function appendLog(agent: LogEntry['agent'], title: string, body: string) {
     setLogs((entries) => [makeLog(agent, title, body), ...entries].slice(0, 80))
   }
 
+  function loadApiKey() {
+    const key = apiKeyDraft.trim()
+
+    if (!key) {
+      setErrorMessage('Cole a chave da OpenRouter antes de carregá-la.')
+      return
+    }
+
+    apiKeyRef.current = key
+    setApiKeyDraft('')
+    setHasApiKey(true)
+    setErrorMessage('')
+    appendLog('sistema', 'Chave carregada', 'A chave foi guardada somente em memória nesta sessão.')
+  }
+
+  function clearApiKey() {
+    apiKeyRef.current = ''
+    setApiKeyDraft('')
+    setHasApiKey(false)
+    appendLog('sistema', 'Chave removida', 'A chave em memória foi apagada.')
+  }
+
   function buildConfig(): BootcampConfig {
-    if (!apiKey.trim()) {
+    if (!apiKeyRef.current.trim()) {
       throw new Error('Informe a chave da OpenRouter antes de iniciar.')
     }
 
@@ -113,7 +139,7 @@ function App() {
     }
 
     return {
-      apiKey: apiKey.trim(),
+      apiKey: apiKeyRef.current.trim(),
       model: model.trim(),
       seedPrompt: seedPrompt.trim(),
       taskInstructions: taskInstructions.trim(),
@@ -308,12 +334,24 @@ function App() {
               <span>OpenRouter API key</span>
               <input
                 type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
+                value={apiKeyDraft}
+                onChange={(event) => setApiKeyDraft(event.target.value)}
                 placeholder="sk-or-..."
                 autoComplete="off"
               />
             </label>
+            <div className="key-row">
+              <span className={hasApiKey ? 'key-loaded' : 'key-empty'}>
+                {hasApiKey ? 'Chave ativa em memória' : 'Nenhuma chave carregada'}
+              </span>
+              <button type="button" className="secondary-button compact" onClick={loadApiKey} disabled={!apiKeyDraft.trim()}>
+                <KeyRound size={14} />
+                Usar chave
+              </button>
+              <button type="button" className="icon-button" onClick={clearApiKey} disabled={!hasApiKey} aria-label="Limpar chave">
+                <X size={15} />
+              </button>
+            </div>
             <label>
               <span>Modelo padrão</span>
               <input value={model} onChange={(event) => setModel(event.target.value)} />
@@ -398,7 +436,7 @@ function App() {
             <MetricCard label="Prompt original" value={originalResult ? `${originalResult.averageScore}/10` : 'sem nota'} score={originalResult?.averageScore} />
             <MetricCard label="Melhor prompt" value={bestResult ? `${bestResult.averageScore}/10` : 'sem nota'} score={bestResult?.averageScore} />
             <MetricCard label="Runs do turno" value={`${currentRuns.length}/${RUNS_PER_PROMPT}`} />
-            <MetricCard label="Falhas críticas" value={bestResult ? String(bestResult.criticalFailures) : '0'} />
+            <MetricCard label="Falhas operacionais" value={String(currentFailedRuns)} />
           </div>
 
           <div className="agent-grid">
@@ -420,9 +458,11 @@ function App() {
                     <article className="run-card" key={run.id}>
                       <div className="run-head">
                         <strong>Run {index + 1}</strong>
-                        <span className={scoreClass(run.evaluation.score)}>{run.evaluation.score}/10</span>
+                        <span className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
+                          {run.status === 'completed' ? `${run.evaluation.score}/10` : runStatusLabel(run.status)}
+                        </span>
                       </div>
-                      <p>{run.output}</p>
+                      <p>{run.output || run.error || 'Run sem output disponível.'}</p>
                     </article>
                   ))}
                 </div>
@@ -437,7 +477,9 @@ function App() {
                   {currentRuns.map((run, index) => (
                     <div className="evaluation-row" key={`eval-${run.id}`}>
                       <span>#{index + 1}</span>
-                      <strong className={scoreClass(run.evaluation.score)}>{run.evaluation.score}/10</strong>
+                      <strong className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
+                        {run.status === 'completed' ? `${run.evaluation.score}/10` : 'falhou'}
+                      </strong>
                       <p>{run.evaluation.summary}</p>
                     </div>
                   ))}
@@ -454,6 +496,8 @@ function App() {
                     <span>Média {bestResult.averageScore}/10</span>
                     <span>Mín. {bestResult.minScore}/10</span>
                     <span>Máx. {bestResult.maxScore}/10</span>
+                    <span>Válidos {bestResult.completedRuns}/{RUNS_PER_PROMPT}</span>
+                    <span>Falhas {bestResult.failedRuns}</span>
                   </div>
                   <pre className="prompt-box">{bestResult.prompt}</pre>
                 </>
@@ -470,6 +514,7 @@ function App() {
                       <th>Turno</th>
                       <th>Nota</th>
                       <th>Min/Max</th>
+                      <th>Válidos</th>
                       <th>Falhas</th>
                     </tr>
                   </thead>
@@ -481,7 +526,8 @@ function App() {
                         <td>
                           {item.minScore}/{item.maxScore}
                         </td>
-                        <td>{item.criticalFailures}</td>
+                        <td>{item.completedRuns}/{RUNS_PER_PROMPT}</td>
+                        <td>{item.failedRuns}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -539,6 +585,15 @@ function statusLabel(status: Status) {
     stopped: 'parado',
     error: 'erro',
     done: 'concluído',
+  }
+  return labels[status]
+}
+
+function runStatusLabel(status: PromptRun['status']) {
+  const labels: Record<PromptRun['status'], string> = {
+    completed: 'ok',
+    output_failed: 'output falhou',
+    evaluation_failed: 'avaliador falhou',
   }
   return labels[status]
 }

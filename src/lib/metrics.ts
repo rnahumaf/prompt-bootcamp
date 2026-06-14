@@ -14,6 +14,16 @@ export function collectAutoMetrics(output: string): AutoMetrics {
   }
 }
 
+export function emptyAutoMetrics(): AutoMetrics {
+  return {
+    characters: 0,
+    paragraphs: 0,
+    markdownFenceBalanced: true,
+    hasReplacementCharacters: false,
+    hasLikelyEncodingIssue: false,
+  }
+}
+
 export function summarizeMetrics(metrics: AutoMetrics) {
   return [
     `Caracteres: ${metrics.characters}`,
