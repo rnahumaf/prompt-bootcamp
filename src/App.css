@@ -226,6 +226,10 @@ textarea:focus {
   margin-top: 8px;
 }
 
+.file-input {
+  display: none;
+}
+
 .key-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -290,6 +294,10 @@ textarea:focus {
   min-height: 38px;
   padding: 0 12px;
   border: 1px solid transparent;
+}
+
+.utility-actions .secondary-button {
+  flex: 1 1 0;
 }
 
 .secondary-button.compact {
@@ -465,6 +473,12 @@ textarea:focus {
   -webkit-box-orient: vertical;
 }
 
+.run-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
 .run-head strong {
   font-size: 0.82rem;
 }
@@ -558,7 +572,8 @@ th {
   line-height: 1.4;
 }
 
-.diff-drawer {
+.diff-drawer,
+.suggestion-drawer {
   position: fixed;
   right: 18px;
   bottom: 18px;
@@ -567,6 +582,11 @@ th {
   max-height: 48vh;
   overflow: hidden;
   box-shadow: var(--shadow);
+}
+
+.suggestion-drawer {
+  bottom: 18px;
+  max-height: 70vh;
 }
 
 .diff-header {
@@ -578,6 +598,35 @@ th {
 .diff-header h2 {
   margin: 0;
   font-size: 1rem;
+}
+
+.suggestion-body {
+  display: grid;
+  gap: 12px;
+  max-height: 56vh;
+  overflow: auto;
+  padding: 14px;
+  scrollbar-gutter: stable;
+}
+
+.suggestion-body section {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fafafa;
+}
+
+.suggestion-body strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.8rem;
+}
+
+.suggestion-body p {
+  margin: 0;
+  color: #52525b;
+  font-size: 0.84rem;
+  line-height: 1.45;
 }
 
 .diff-header p {
@@ -662,6 +711,10 @@ th {
   .diff-drawer {
     left: 18px;
   }
+
+  .suggestion-drawer {
+    left: 18px;
+  }
 }
 
 @media (max-width: 860px) {
@@ -693,7 +746,8 @@ th {
     grid-column: span 1;
   }
 
-  .diff-drawer {
+  .diff-drawer,
+  .suggestion-drawer {
     position: static;
     margin: 12px 14px 20px;
     max-height: none;

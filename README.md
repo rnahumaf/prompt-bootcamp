@@ -40,6 +40,15 @@ O campo é editável caso o ID do modelo na OpenRouter precise de ajuste.
 
 Falhas operacionais de API ou de parsing do avaliador não entram na média do prompt. O app tenta retries e reparo de JSON antes de marcar um run como falho.
 
+## V2
+
+- O CRIADOR também tem reparo de JSON quando retorna Markdown ou texto livre.
+- `Exportar` gera um arquivo JSON com progresso, histórico, runs, critérios e melhor prompt, sem incluir a chave.
+- `Importar` carrega um arquivo de progresso para continuar uma sessão anterior após carregar uma nova chave.
+- Cada run tem o botão `Avaliar run`, que aciona um avaliador de critérios.
+- Sugestões aceitas são adicionadas aos critérios, incrementam a versão dos critérios e reiniciam a avaliação do zero.
+- Notas antigas não são comparadas após alteração de critérios.
+
 ## Scripts
 
 ```bash

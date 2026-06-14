@@ -4,8 +4,10 @@ import { diffLines } from 'diff'
 import {
   Activity,
   Bot,
+  Check,
   ClipboardList,
   Diff,
+  Download,
   KeyRound,
   Loader2,
   Play,
@@ -15,16 +17,27 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react'
 import './App.css'
 import {
   createCandidatePrompt,
   createInitialPrompt,
+  evaluateRunForCriteria,
   runPromptEvaluation,
 } from './lib/bootcamp'
 import { DEFAULT_MODEL, RUNS_PER_PROMPT } from './types'
-import type { BootcampConfig, Candidate, LogEntry, PromptResult, PromptRun, Status } from './types'
+import type {
+  BootcampConfig,
+  Candidate,
+  LogEntry,
+  ProgressExport,
+  PromptResult,
+  PromptRun,
+  RunCriterionSuggestion,
+  Status,
+} from './types'
 
 const starterCriteria = `- O output deve cumprir exatamente o formato solicitado pelo usuário.
 - O output deve ser conciso e não incluir informações irrelevantes.
@@ -70,6 +83,7 @@ function App() {
   const [seedPrompt, setSeedPrompt] = useState('')
   const [taskInstructions, setTaskInstructions] = useState(starterTask)
   const [evaluationCriteria, setEvaluationCriteria] = useState(starterCriteria)
+  const [criteriaVersion, setCriteriaVersion] = useState(1)
   const [inputs, setInputs] = useState([starterInput])
   const [userInstruction, setUserInstruction] = useState('')
   const [status, setStatus] = useState<Status>('idle')
@@ -83,7 +97,11 @@ function App() {
   const [lastCandidate, setLastCandidate] = useState<Candidate | null>(null)
   const [diffBefore, setDiffBefore] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
+  const [runSuggestion, setRunSuggestion] = useState<RunCriterionSuggestion | null>(null)
+  const [suggestionDraft, setSuggestionDraft] = useState('')
+  const [evaluatingRunId, setEvaluatingRunId] = useState('')
   const abortRef = useRef<AbortController | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
 
   const isRunning = status === 'running'
   const canSend = status === 'paused' || status === 'stopped' || status === 'done'
@@ -93,6 +111,22 @@ function App() {
 
   function appendLog(agent: LogEntry['agent'], title: string, body: string) {
     setLogs((entries) => [makeLog(agent, title, body), ...entries].slice(0, 80))
+  }
+
+  function resetResultsForCriteriaChange(nextCriteria: string) {
+    const promptToKeep = bestResult?.prompt || seedPrompt
+    setEvaluationCriteria(nextCriteria)
+    setCriteriaVersion((version) => version + 1)
+    setSeedPrompt(promptToKeep)
+    setCurrentRuns([])
+    setHistory([])
+    setOriginalResult(null)
+    setBestResult(null)
+    setLastCandidate(null)
+    setDiffBefore('')
+    setStatus('idle')
+    setErrorMessage('')
+    appendLog('criterios', 'Critérios atualizados', 'As notas anteriores foram arquivadas implicitamente; reinicie a avaliação do zero.')
   }
 
   function loadApiKey() {
@@ -115,6 +149,121 @@ function App() {
     setApiKeyDraft('')
     setHasApiKey(false)
     appendLog('sistema', 'Chave removida', 'A chave em memória foi apagada.')
+  }
+
+  function exportProgress() {
+    const payload: ProgressExport = {
+      schemaVersion: 2,
+      exportedAt: new Date().toISOString(),
+      model,
+      seedPrompt,
+      taskInstructions,
+      evaluationCriteria,
+      criteriaVersion,
+      inputs,
+      userInstruction,
+      currentRuns,
+      history,
+      originalResult,
+      bestResult,
+      lastCandidate,
+      diffBefore,
+      logs,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `prompt-bootcamp-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(url)
+    appendLog('sistema', 'Progresso exportado', 'Arquivo JSON gerado sem incluir a chave OpenRouter.')
+  }
+
+  async function importProgress(file: File | undefined) {
+    if (!file) return
+
+    try {
+      const parsed = JSON.parse(await file.text()) as Partial<ProgressExport>
+
+      if (parsed.schemaVersion !== 2) {
+        throw new Error('Arquivo de progresso incompatível. Esperado schemaVersion 2.')
+      }
+
+      setModel(parsed.model || DEFAULT_MODEL)
+      setSeedPrompt(parsed.seedPrompt || '')
+      setTaskInstructions(parsed.taskInstructions || starterTask)
+      setEvaluationCriteria(parsed.evaluationCriteria || starterCriteria)
+      setCriteriaVersion(Number(parsed.criteriaVersion) || 1)
+      setInputs(Array.isArray(parsed.inputs) && parsed.inputs.length ? parsed.inputs : [starterInput])
+      setUserInstruction(parsed.userInstruction || '')
+      setCurrentRuns(Array.isArray(parsed.currentRuns) ? parsed.currentRuns : [])
+      setHistory(Array.isArray(parsed.history) ? parsed.history : [])
+      setOriginalResult(parsed.originalResult ?? null)
+      setBestResult(parsed.bestResult ?? null)
+      setLastCandidate(parsed.lastCandidate ?? null)
+      setDiffBefore(parsed.diffBefore || '')
+      setLogs(Array.isArray(parsed.logs) ? [makeLog('sistema', 'Progresso importado', 'Sessão carregada de JSON; carregue a chave para continuar.'), ...parsed.logs].slice(0, 80) : [
+        makeLog('sistema', 'Progresso importado', 'Sessão carregada de JSON; carregue a chave para continuar.'),
+      ])
+      setRunSuggestion(null)
+      setSuggestionDraft('')
+      setStatus('stopped')
+      setErrorMessage('')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Falha ao importar progresso.'
+      setStatus('error')
+      setErrorMessage(message)
+      appendLog('sistema', 'Importação falhou', message)
+    } finally {
+      if (importInputRef.current) {
+        importInputRef.current.value = ''
+      }
+    }
+  }
+
+  async function evaluateRun(run: PromptRun) {
+    try {
+      const config = buildConfig()
+      const controller = new AbortController()
+      abortRef.current = controller
+      setEvaluatingRunId(run.id)
+      setErrorMessage('')
+      appendLog('criterios', 'Avaliando run', `Buscando lacunas nos critérios a partir do input ${run.inputIndex + 1}.`)
+
+      const suggestion = await evaluateRunForCriteria(config, run, controller.signal)
+      setRunSuggestion(suggestion)
+      setSuggestionDraft(suggestion.proposedCriterion)
+      appendLog('criterios', 'Sugestão criada', suggestion.title)
+    } catch (error) {
+      handleRuntimeError(error)
+    } finally {
+      setEvaluatingRunId('')
+    }
+  }
+
+  function acceptSuggestion() {
+    if (!runSuggestion) return
+
+    const criterion = suggestionDraft.trim()
+    if (!criterion) {
+      setErrorMessage('A sugestão aceita precisa conter um critério.')
+      return
+    }
+
+    const nextCriteria = `${evaluationCriteria.trim()}\n${criterion.startsWith('-') ? criterion : `- ${criterion}`}`
+    resetResultsForCriteriaChange(nextCriteria)
+    setRunSuggestion(null)
+    setSuggestionDraft('')
+  }
+
+  function rejectSuggestion() {
+    setRunSuggestion(null)
+    setSuggestionDraft('')
+    appendLog('criterios', 'Sugestão rejeitada', 'Os critérios atuais foram preservados.')
   }
 
   function buildConfig(): BootcampConfig {
@@ -356,6 +505,23 @@ function App() {
               <span>Modelo padrão</span>
               <input value={model} onChange={(event) => setModel(event.target.value)} />
             </label>
+            <div className="action-row utility-actions">
+              <button type="button" className="secondary-button" onClick={exportProgress}>
+                <Download size={15} />
+                Exportar
+              </button>
+              <button type="button" className="secondary-button" onClick={() => importInputRef.current?.click()} disabled={isRunning}>
+                <Upload size={15} />
+                Importar
+              </button>
+              <input
+                ref={importInputRef}
+                className="file-input"
+                type="file"
+                accept="application/json,.json"
+                onChange={(event) => void importProgress(event.target.files?.[0])}
+              />
+            </div>
           </Panel>
 
           <Panel title="Prompt e tarefa" icon={<Bot size={17} />}>
@@ -376,7 +542,7 @@ function App() {
 
           <Panel title="Critérios e inputs" icon={<ClipboardList size={17} />}>
             <label>
-              <span>Critérios de avaliação</span>
+              <span>Critérios de avaliação · v{criteriaVersion}</span>
               <textarea
                 value={evaluationCriteria}
                 onChange={(event) => setEvaluationCriteria(event.target.value)}
@@ -463,6 +629,17 @@ function App() {
                         </span>
                       </div>
                       <p>{run.output || run.error || 'Run sem output disponível.'}</p>
+                      <div className="run-actions">
+                        <button
+                          type="button"
+                          className="secondary-button compact"
+                          onClick={() => void evaluateRun(run)}
+                          disabled={isRunning || Boolean(evaluatingRunId)}
+                        >
+                          {evaluatingRunId === run.id ? <Loader2 size={14} className="spin" /> : <ShieldCheck size={14} />}
+                          Avaliar run
+                        </button>
+                      </div>
                     </article>
                   ))}
                 </div>
@@ -552,6 +729,48 @@ function App() {
         </section>
       </section>
 
+      {runSuggestion ? (
+        <section className="suggestion-drawer" aria-label="Sugestão do avaliador de run">
+          <div className="diff-header">
+            <div>
+              <h2>{runSuggestion.title}</h2>
+              <p>Escopo: {scopeLabel(runSuggestion.scope)}. Aceitar altera os critérios e reinicia a avaliação do zero.</p>
+            </div>
+            <button type="button" className="icon-button" onClick={rejectSuggestion} aria-label="Fechar sugestão">
+              <X size={15} />
+            </button>
+          </div>
+          <div className="suggestion-body">
+            <section>
+              <strong>Evidência</strong>
+              <p>{runSuggestion.evidence}</p>
+            </section>
+            <section>
+              <strong>Risco</strong>
+              <p>{runSuggestion.risk}</p>
+            </section>
+            <section>
+              <strong>Exemplo de pontuação</strong>
+              <p>{runSuggestion.scoringExample}</p>
+            </section>
+            <label>
+              <span>Critério proposto</span>
+              <textarea value={suggestionDraft} onChange={(event) => setSuggestionDraft(event.target.value)} rows={4} />
+            </label>
+            <div className="action-row">
+              <button type="button" className="primary-button" onClick={acceptSuggestion}>
+                <Check size={16} />
+                Aceitar e reiniciar
+              </button>
+              <button type="button" className="secondary-button" onClick={rejectSuggestion}>
+                <X size={15} />
+                Rejeitar
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       {status === 'paused' && bestResult ? (
         <section className="diff-drawer" aria-label="Diff visual do prompt">
           <div className="diff-header">
@@ -596,6 +815,18 @@ function runStatusLabel(status: PromptRun['status']) {
     evaluation_failed: 'avaliador falhou',
   }
   return labels[status]
+}
+
+function scopeLabel(scope: RunCriterionSuggestion['scope']) {
+  const labels: Record<RunCriterionSuggestion['scope'], string> = {
+    global: 'global',
+    especialidade: 'especialidade',
+    formato: 'formato',
+    seguranca: 'segurança',
+    concisao: 'concisão',
+    outro: 'outro',
+  }
+  return labels[scope]
 }
 
 function Panel({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {

@@ -2,7 +2,14 @@ import { diffLines } from 'diff'
 import { callOpenRouter } from './openrouter'
 import { parseJsonObject } from './json'
 import { collectAutoMetrics, emptyAutoMetrics, summarizeMetrics } from './metrics'
-import type { BootcampConfig, Candidate, Evaluation, PromptResult, PromptRun } from '../types'
+import type {
+  BootcampConfig,
+  Candidate,
+  Evaluation,
+  PromptResult,
+  PromptRun,
+  RunCriterionSuggestion,
+} from '../types'
 import { RUNS_PER_PROMPT } from '../types'
 
 type Runtime = Pick<BootcampConfig, 'apiKey' | 'model' | 'taskInstructions' | 'evaluationCriteria' | 'inputs'>
@@ -14,6 +21,7 @@ type CandidatePayload = {
 }
 
 type EvaluationPayload = Partial<Evaluation>
+type RunCriterionSuggestionPayload = Partial<Omit<RunCriterionSuggestion, 'runId'>>
 
 function safeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -88,13 +96,8 @@ Responda neste formato:
     ],
   })
 
-  const parsed = parseJsonObject<CandidatePayload>(content)
-
-  if (!parsed.prompt?.trim()) {
-    throw new Error('O CRIADOR não retornou um prompt inicial válido.')
-  }
-
-  return parsed.prompt.trim()
+  const parsed = await parseOrRepairCandidate(runtime, content, 'prompt inicial', signal)
+  return parsed.prompt
 }
 
 export async function createCandidatePrompt(
@@ -157,17 +160,147 @@ Responda somente neste JSON:
     ],
   })
 
-  const parsed = parseJsonObject<CandidatePayload>(content)
+  const parsed = await parseOrRepairCandidate(runtime, content, 'candidato', signal)
 
+  return {
+    ...parsed,
+    diff: parsed.diff || buildDiff(best.prompt, parsed.prompt),
+  }
+}
+
+export async function evaluateRunForCriteria(
+  runtime: Runtime,
+  run: PromptRun,
+  signal?: AbortSignal,
+): Promise<RunCriterionSuggestion> {
+  const content = await callOpenRouter({
+    apiKey: runtime.apiKey,
+    model: runtime.model,
+    temperature: 0.2,
+    maxTokens: 1800,
+    jsonMode: true,
+    label: `avaliador de run: ${run.id}`,
+    signal,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Você é o AVALIADOR DE RUNS. Sua tarefa não é dar nota ao output. Sua tarefa é identificar lacunas nos CRITÉRIOS DE AVALIAÇÃO atuais que poderiam melhorar o treinamento futuro. Responda somente JSON válido.',
+      },
+      {
+        role: 'user',
+        content: `PROMPT USADO NO RUN:
+\`\`\`md
+${run.prompt}
+\`\`\`
+
+CRITÉRIOS DE AVALIAÇÃO ATUAIS:
+\`\`\`md
+${runtime.evaluationCriteria}
+\`\`\`
+
+INPUT DO RUN:
+\`\`\`txt
+${run.input}
+\`\`\`
+
+OUTPUT DO RUN:
+\`\`\`txt
+${run.output || run.error || 'Sem output disponível.'}
+\`\`\`
+
+AVALIAÇÃO ORIGINAL DO RUN:
+${JSON.stringify(run.evaluation, null, 2)}
+
+Proponha no máximo UMA melhoria objetiva aos critérios. Evite duplicar critérios existentes. Não transforme uma preferência local em regra global sem declarar o risco.
+
+Responda neste JSON:
+{
+  "title": "nome curto da sugestão",
+  "evidence": "evidência concreta observada no input/output",
+  "proposedCriterion": "- critério de avaliação novo ou revisado",
+  "scope": "global|especialidade|formato|seguranca|concisao|outro",
+  "risk": "risco de overfitting ou rigidez excessiva",
+  "scoringExample": "exemplo curto de como pontuar esse critério"
+}`,
+      },
+    ],
+  })
+
+  try {
+    return normalizeRunCriterionSuggestion(run.id, parseJsonObject<RunCriterionSuggestionPayload>(content))
+  } catch (error) {
+    const repaired = await repairRunCriterionSuggestion(runtime, content, error instanceof Error ? error.message : 'JSON inválido.', signal)
+    return normalizeRunCriterionSuggestion(run.id, parseJsonObject<RunCriterionSuggestionPayload>(repaired))
+  }
+}
+
+async function parseOrRepairCandidate(
+  runtime: Runtime,
+  content: string,
+  label: string,
+  signal?: AbortSignal,
+): Promise<Candidate> {
+  try {
+    return normalizeCandidate(parseJsonObject<CandidatePayload>(content), label)
+  } catch (error) {
+    const repaired = await repairCandidate(runtime, content, error instanceof Error ? error.message : 'JSON inválido.', label, signal)
+    return normalizeCandidate(parseJsonObject<CandidatePayload>(repaired), `${label} reparado`)
+  }
+}
+
+function normalizeCandidate(parsed: CandidatePayload, label: string): Candidate {
   if (!parsed.prompt?.trim()) {
-    throw new Error('O CRIADOR não retornou um candidato válido.')
+    throw new Error(`O CRIADOR não retornou um ${label} válido.`)
   }
 
   return {
     prompt: parsed.prompt.trim(),
     rationale: parsed.rationale?.trim() || 'Candidato criado sem justificativa detalhada.',
-    diff: parsed.diff?.trim() || buildDiff(best.prompt, parsed.prompt.trim()),
+    diff: parsed.diff?.trim() || '',
   }
+}
+
+async function repairCandidate(
+  runtime: Runtime,
+  rawContent: string,
+  errorMessage: string,
+  label: string,
+  signal?: AbortSignal,
+) {
+  return callOpenRouter({
+    apiKey: runtime.apiKey,
+    model: runtime.model,
+    temperature: 0,
+    maxTokens: 3200,
+    jsonMode: false,
+    label: `criador: reparo JSON ${label}`,
+    signal,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Você converte respostas de melhoria de prompt para JSON estrito. Preserve integralmente o prompt proposto. Responda somente um objeto JSON válido.',
+      },
+      {
+        role: 'user',
+        content: `A resposta abaixo deveria ser JSON, mas falhou com este erro:
+${errorMessage}
+
+Converta para este formato:
+{
+  "rationale": "mudança proposta em uma frase objetiva",
+  "diff": "diff unificado ou lista objetiva de alterações",
+  "prompt": "system prompt completo"
+}
+
+Resposta original:
+\`\`\`txt
+${rawContent}
+\`\`\``,
+      },
+    ],
+  })
 }
 
 export async function runPromptEvaluation(
@@ -216,6 +349,7 @@ export async function runPromptEvaluation(
         status: evaluation.status === 'ok' ? 'completed' : 'evaluation_failed',
         inputIndex,
         input,
+        prompt,
         output,
         metrics,
         evaluation,
@@ -228,6 +362,7 @@ export async function runPromptEvaluation(
         status: 'output_failed',
         inputIndex,
         input,
+        prompt,
         output: '',
         metrics: emptyAutoMetrics(),
         evaluation: {
@@ -267,6 +402,72 @@ export async function runPromptEvaluation(
     worstOutput: sorted[0]?.output ?? '',
     runs,
   }
+}
+
+function normalizeRunCriterionSuggestion(
+  runId: string,
+  parsed: RunCriterionSuggestionPayload,
+): RunCriterionSuggestion {
+  const allowedScopes = new Set(['global', 'especialidade', 'formato', 'seguranca', 'concisao', 'outro'])
+  const scope = allowedScopes.has(parsed.scope ?? '') ? parsed.scope : 'outro'
+
+  if (!parsed.proposedCriterion?.trim()) {
+    throw new Error('O avaliador de run não retornou critério proposto.')
+  }
+
+  return {
+    runId,
+    title: parsed.title?.trim() || 'Sugestão de critério',
+    evidence: parsed.evidence?.trim() || 'Evidência não detalhada.',
+    proposedCriterion: parsed.proposedCriterion.trim(),
+    scope: scope as RunCriterionSuggestion['scope'],
+    risk: parsed.risk?.trim() || 'Risco não detalhado.',
+    scoringExample: parsed.scoringExample?.trim() || 'Sem exemplo de pontuação.',
+  }
+}
+
+async function repairRunCriterionSuggestion(
+  runtime: Runtime,
+  rawContent: string,
+  errorMessage: string,
+  signal?: AbortSignal,
+) {
+  return callOpenRouter({
+    apiKey: runtime.apiKey,
+    model: runtime.model,
+    temperature: 0,
+    maxTokens: 1400,
+    jsonMode: false,
+    label: 'avaliador de run: reparo JSON',
+    signal,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Você converte sugestões de critérios para JSON estrito. Responda somente um objeto JSON válido.',
+      },
+      {
+        role: 'user',
+        content: `A resposta abaixo deveria ser JSON, mas falhou com este erro:
+${errorMessage}
+
+Converta para este formato:
+{
+  "title": "nome curto da sugestão",
+  "evidence": "evidência concreta",
+  "proposedCriterion": "- critério de avaliação novo ou revisado",
+  "scope": "global|especialidade|formato|seguranca|concisao|outro",
+  "risk": "risco de overfitting ou rigidez",
+  "scoringExample": "exemplo curto de pontuação"
+}
+
+Resposta original:
+\`\`\`txt
+${rawContent}
+\`\`\``,
+      },
+    ],
+  })
 }
 
 async function evaluateOutput(

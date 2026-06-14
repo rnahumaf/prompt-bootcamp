@@ -1,7 +1,7 @@
 export const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash'
 export const RUNS_PER_PROMPT = 10
 
-export type AgentName = 'sistema' | 'criador' | 'executor' | 'avaliador' | 'usuario'
+export type AgentName = 'sistema' | 'criador' | 'executor' | 'avaliador' | 'usuario' | 'criterios'
 
 export type Status = 'idle' | 'running' | 'paused' | 'stopped' | 'error' | 'done'
 
@@ -42,6 +42,7 @@ export type PromptRun = {
   status: 'completed' | 'output_failed' | 'evaluation_failed'
   inputIndex: number
   input: string
+  prompt: string
   output: string
   metrics: AutoMetrics
   evaluation: Evaluation
@@ -67,6 +68,35 @@ export type Candidate = {
   prompt: string
   rationale: string
   diff: string
+}
+
+export type RunCriterionSuggestion = {
+  runId: string
+  title: string
+  evidence: string
+  proposedCriterion: string
+  scope: 'global' | 'especialidade' | 'formato' | 'seguranca' | 'concisao' | 'outro'
+  risk: string
+  scoringExample: string
+}
+
+export type ProgressExport = {
+  schemaVersion: 2
+  exportedAt: string
+  model: string
+  seedPrompt: string
+  taskInstructions: string
+  evaluationCriteria: string
+  criteriaVersion: number
+  inputs: string[]
+  userInstruction: string
+  currentRuns: PromptRun[]
+  history: PromptResult[]
+  originalResult: PromptResult | null
+  bestResult: PromptResult | null
+  lastCandidate: Candidate | null
+  diffBefore: string
+  logs: LogEntry[]
 }
 
 export type BootcampConfig = {
