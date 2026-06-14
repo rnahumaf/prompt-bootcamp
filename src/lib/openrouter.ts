@@ -6,6 +6,7 @@ type Message = {
 type ChatRequest = {
   apiKey: string
   model: string
+  sessionId?: string
   messages: Message[]
   temperature?: number
   maxTokens?: number
@@ -82,6 +83,7 @@ export async function callOpenRouter(request: ChatRequest) {
 async function callOpenRouterOnce({
   apiKey,
   model,
+  sessionId,
   messages,
   temperature = 0.35,
   maxTokens = 1800,
@@ -97,6 +99,7 @@ async function callOpenRouterOnce({
     body: JSON.stringify({
       apiKey,
       model,
+      sessionId,
       messages,
       temperature,
       maxTokens,

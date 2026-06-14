@@ -11,6 +11,7 @@ const MessageSchema = z.object({
 const ChatSchema = z.object({
   apiKey: z.string().min(1),
   model: z.string().min(1),
+  sessionId: z.string().min(1).max(256).optional(),
   messages: z.array(MessageSchema).min(1),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(12000).optional(),
@@ -35,7 +36,16 @@ app.post('/api/openrouter/chat', async (request, response) => {
     return
   }
 
-  const { apiKey, model, messages, temperature = 0.35, maxTokens = 1800, jsonMode = false, label = 'chamada' } = parsed.data
+  const {
+    apiKey,
+    model,
+    sessionId,
+    messages,
+    temperature = 0.35,
+    maxTokens = 1800,
+    jsonMode = false,
+    label = 'chamada',
+  } = parsed.data
 
   try {
     const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -45,9 +55,11 @@ app.post('/api/openrouter/chat', async (request, response) => {
         'Content-Type': 'application/json',
         'HTTP-Referer': 'http://localhost:5173',
         'X-Title': 'Prompt Bootcamp',
+        ...(sessionId ? { 'x-session-id': sessionId } : {}),
       },
       body: JSON.stringify({
         model,
+        ...(sessionId ? { session_id: sessionId } : {}),
         messages,
         temperature,
         max_tokens: maxTokens,

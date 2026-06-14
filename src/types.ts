@@ -39,6 +39,7 @@ export type Evaluation = {
 
 export type PromptRun = {
   id: string
+  runNumber?: number
   status: 'completed' | 'output_failed' | 'evaluation_failed'
   inputIndex: number
   input: string
@@ -81,9 +82,11 @@ export type RunCriterionSuggestion = {
 }
 
 export type ProgressExport = {
-  schemaVersion: 2
+  schemaVersion: 2 | 3
   exportedAt: string
   model: string
+  maxParallelRuns?: number
+  sessionId?: string
   seedPrompt: string
   taskInstructions: string
   evaluationCriteria: string
@@ -102,6 +105,8 @@ export type ProgressExport = {
 export type BootcampConfig = {
   apiKey: string
   model: string
+  maxParallelRuns: number
+  sessionId: string
   seedPrompt: string
   taskInstructions: string
   evaluationCriteria: string

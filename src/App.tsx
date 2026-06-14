@@ -58,6 +58,10 @@ function nowLabel() {
   }).format(new Date())
 }
 
+function makeSessionId() {
+  return `prompt-bootcamp-${Date.now()}-${Math.random().toString(16).slice(2)}`.slice(0, 120)
+}
+
 function makeLog(agent: LogEntry['agent'], title: string, body: string): LogEntry {
   return {
     id: `${agent}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -75,11 +79,27 @@ function scoreClass(score?: number) {
   return 'score-bad'
 }
 
+function clampParallelRuns(value: unknown) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return RUNS_PER_PROMPT
+  return Math.max(1, Math.min(RUNS_PER_PROMPT, Math.round(numeric)))
+}
+
+function updateRunSlot(runs: PromptRun[], run: PromptRun, index: number) {
+  const runNumber = run.runNumber ?? index + 1
+  return runs
+    .filter((item) => (item.runNumber ?? 0) !== runNumber)
+    .concat({ ...run, runNumber })
+    .sort((left, right) => (left.runNumber ?? 0) - (right.runNumber ?? 0))
+}
+
 function App() {
   const apiKeyRef = useRef('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [hasApiKey, setHasApiKey] = useState(false)
   const [model, setModel] = useState(DEFAULT_MODEL)
+  const [maxParallelRuns, setMaxParallelRuns] = useState(RUNS_PER_PROMPT)
+  const [sessionId, setSessionId] = useState(makeSessionId)
   const [seedPrompt, setSeedPrompt] = useState('')
   const [taskInstructions, setTaskInstructions] = useState(starterTask)
   const [evaluationCriteria, setEvaluationCriteria] = useState(starterCriteria)
@@ -154,9 +174,11 @@ function App() {
 
   function exportProgress() {
     const payload: ProgressExport = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       exportedAt: new Date().toISOString(),
       model,
+      maxParallelRuns,
+      sessionId,
       seedPrompt,
       taskInstructions,
       evaluationCriteria,
@@ -190,11 +212,13 @@ function App() {
     try {
       const parsed = JSON.parse(await file.text()) as Partial<ProgressExport>
 
-      if (parsed.schemaVersion !== 2) {
-        throw new Error('Arquivo de progresso incompatível. Esperado schemaVersion 2.')
+      if (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3) {
+        throw new Error('Arquivo de progresso incompatível. Esperado schemaVersion 2 ou 3.')
       }
 
       setModel(parsed.model || DEFAULT_MODEL)
+      setMaxParallelRuns(clampParallelRuns(parsed.maxParallelRuns))
+      setSessionId(parsed.sessionId || makeSessionId())
       setSeedPrompt(parsed.seedPrompt || '')
       setTaskInstructions(parsed.taskInstructions || starterTask)
       setEvaluationCriteria(parsed.evaluationCriteria || starterCriteria)
@@ -291,6 +315,8 @@ function App() {
     return {
       apiKey: apiKeyRef.current.trim(),
       model: model.trim(),
+      maxParallelRuns,
+      sessionId,
       seedPrompt: seedPrompt.trim(),
       taskInstructions: taskInstructions.trim(),
       evaluationCriteria: evaluationCriteria.trim(),
@@ -312,7 +338,11 @@ function App() {
       setBestResult(null)
       setLastCandidate(null)
       setDiffBefore('')
-      appendLog('sistema', 'Sessão iniciada', `${RUNS_PER_PROMPT} avaliações serão usadas por prompt.`)
+      appendLog(
+        'sistema',
+        'Sessão iniciada',
+        `${RUNS_PER_PROMPT} avaliações serão usadas por prompt, com até ${config.maxParallelRuns} execuções simultâneas.`,
+      )
 
       const initialPrompt =
         config.seedPrompt ||
@@ -326,7 +356,7 @@ function App() {
         config,
         initialPrompt,
         'Baseline',
-        (run) => setCurrentRuns((runs) => [...runs, run]),
+        (run, index) => setCurrentRuns((runs) => updateRunSlot(runs, run, index)),
         controller.signal,
       )
 
@@ -393,7 +423,7 @@ function App() {
         config,
         candidate.prompt,
         `Candidato ${history.length + inferiorTurns + 1}`,
-        (run) => setCurrentRuns((runs) => [...runs, run]),
+        (run, index) => setCurrentRuns((runs) => updateRunSlot(runs, run, index)),
         controller.signal,
       )
 
@@ -508,6 +538,19 @@ function App() {
               <span>Modelo padrão</span>
               <input value={model} onChange={(event) => setModel(event.target.value)} />
             </label>
+            <label>
+              <span>Execuções paralelas</span>
+              <input
+                type="number"
+                min={1}
+                max={RUNS_PER_PROMPT}
+                value={maxParallelRuns}
+                onChange={(event) => setMaxParallelRuns(clampParallelRuns(event.target.value))}
+              />
+            </label>
+            <p className="hint-text">
+              Até {RUNS_PER_PROMPT} runs simultâneos. Reduza se houver rate limit ou instabilidade do provedor.
+            </p>
             <div className="action-row utility-actions">
               <button type="button" className="secondary-button" onClick={exportProgress}>
                 <Download size={15} />
@@ -626,7 +669,7 @@ function App() {
                   {currentRuns.map((run, index) => (
                     <article className="run-card" key={run.id}>
                       <div className="run-head">
-                        <strong>Run {index + 1}</strong>
+                        <strong>Run {run.runNumber ?? index + 1}</strong>
                         <span className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
                           {run.status === 'completed' ? `${run.evaluation.score}/10` : runStatusLabel(run.status)}
                         </span>
@@ -656,7 +699,7 @@ function App() {
                 <div className="evaluation-list">
                   {currentRuns.map((run, index) => (
                     <div className="evaluation-row" key={`eval-${run.id}`}>
-                      <span>#{index + 1}</span>
+                      <span>#{run.runNumber ?? index + 1}</span>
                       <strong className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
                         {run.status === 'completed' ? `${run.evaluation.score}/10` : 'falhou'}
                       </strong>

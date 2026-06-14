@@ -49,6 +49,13 @@ Falhas operacionais de API ou de parsing do avaliador não entram na média do p
 - Sugestões aceitas são adicionadas aos critérios, incrementam a versão dos critérios e reiniciam a avaliação do zero.
 - Notas antigas não são comparadas após alteração de critérios.
 
+## Performance e cache
+
+- O app envia um `session_id` estável para a OpenRouter durante a sessão. Isso favorece sticky routing e prompt caching em modelos/provedores compatíveis.
+- O progresso exportado preserva o `session_id`, permitindo continuar a sessão anterior com a mesma afinidade de roteamento após importar o JSON.
+- O response cache explícito da OpenRouter não é ativado por padrão nos runs de avaliação, porque respostas idênticas por cache poderiam reduzir a variância que o bootcamp tenta medir.
+- Os 10 runs de cada prompt são executados em paralelo por padrão. O campo `Execuções paralelas` permite reduzir de 10 até 1 se houver rate limit, erro transitório do provedor ou instabilidade local.
+
 ## Scripts
 
 ```bash

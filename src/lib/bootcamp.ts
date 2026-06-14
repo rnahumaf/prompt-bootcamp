@@ -12,7 +12,10 @@ import type {
 } from '../types'
 import { RUNS_PER_PROMPT } from '../types'
 
-type Runtime = Pick<BootcampConfig, 'apiKey' | 'model' | 'taskInstructions' | 'evaluationCriteria' | 'inputs'>
+type Runtime = Pick<
+  BootcampConfig,
+  'apiKey' | 'model' | 'maxParallelRuns' | 'sessionId' | 'taskInstructions' | 'evaluationCriteria' | 'inputs'
+>
 
 type CandidatePayload = {
   prompt?: string
@@ -25,6 +28,13 @@ type RunCriterionSuggestionPayload = Partial<Omit<RunCriterionSuggestion, 'runId
 
 function safeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function isAbortError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && /abort|interrompida/i.test(error.message))
+  )
 }
 
 function formatScore(result?: PromptResult) {
@@ -62,6 +72,7 @@ export async function createInitialPrompt(runtime: Runtime, signal?: AbortSignal
   const content = await callOpenRouter({
     apiKey: runtime.apiKey,
     model: runtime.model,
+    sessionId: runtime.sessionId,
     temperature: 0.25,
     maxTokens: 2200,
     jsonMode: true,
@@ -114,6 +125,7 @@ export async function createCandidatePrompt(
       const content = await callOpenRouter({
         apiKey: runtime.apiKey,
         model: runtime.model,
+        sessionId: runtime.sessionId,
         temperature: attempt === 1 ? 0.45 : 0.2,
         maxTokens: 3600,
         jsonMode: true,
@@ -178,6 +190,10 @@ Responda somente neste JSON:
         diff: parsed.diff || buildDiff(best.prompt, parsed.prompt),
       }
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error
+      }
+
       lastError = error instanceof Error ? error : new Error('Falha desconhecida ao criar candidato.')
     }
   }
@@ -193,6 +209,7 @@ export async function evaluateRunForCriteria(
   const content = await callOpenRouter({
     apiKey: runtime.apiKey,
     model: runtime.model,
+    sessionId: runtime.sessionId,
     temperature: 0.2,
     maxTokens: 1800,
     jsonMode: true,
@@ -303,6 +320,7 @@ async function repairCandidate(
   return callOpenRouter({
     apiKey: runtime.apiKey,
     model: runtime.model,
+    sessionId: runtime.sessionId,
     temperature: 0,
     maxTokens: 3200,
     jsonMode: false,
@@ -339,12 +357,14 @@ export async function runPromptEvaluation(
   runtime: Runtime,
   prompt: string,
   label: string,
-  onRun?: (run: PromptRun) => void,
+  onRun?: (run: PromptRun, index: number) => void,
   signal?: AbortSignal,
 ): Promise<PromptResult> {
-  const runs: PromptRun[] = []
+  const runs = new Array<PromptRun | undefined>(RUNS_PER_PROMPT)
+  const maxParallelRuns = Math.max(1, Math.min(RUNS_PER_PROMPT, runtime.maxParallelRuns || RUNS_PER_PROMPT))
+  let nextIndex = 0
 
-  for (let index = 0; index < RUNS_PER_PROMPT; index += 1) {
+  async function runOne(index: number): Promise<PromptRun> {
     if (signal?.aborted) {
       throw new DOMException('Execução interrompida pelo usuário.', 'AbortError')
     }
@@ -358,6 +378,7 @@ export async function runPromptEvaluation(
       const output = await callOpenRouter({
         apiKey: runtime.apiKey,
         model: runtime.model,
+        sessionId: runtime.sessionId,
         temperature: 0.2,
         maxTokens: 1800,
         label: `${label}: execução ${index + 1}`,
@@ -378,6 +399,7 @@ export async function runPromptEvaluation(
       const evaluation = await evaluateOutput(runtime, input, output, metrics, index + 1, signal)
       run = {
         id: safeId('run'),
+        runNumber: index + 1,
         status: evaluation.status === 'ok' ? 'completed' : 'evaluation_failed',
         inputIndex,
         input,
@@ -388,9 +410,14 @@ export async function runPromptEvaluation(
         error: evaluation.error,
       }
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error
+      }
+
       const message = error instanceof Error ? error.message : 'Falha desconhecida ao gerar output.'
       run = {
         id: safeId('run'),
+        runNumber: index + 1,
         status: 'output_failed',
         inputIndex,
         input,
@@ -409,11 +436,24 @@ export async function runPromptEvaluation(
       }
     }
 
-    runs.push(run)
-    onRun?.(run)
+    return run
   }
 
-  const scoredRuns = runs.filter((run) => run.status === 'completed' && run.evaluation.status === 'ok')
+  async function worker() {
+    while (nextIndex < RUNS_PER_PROMPT) {
+      const index = nextIndex
+      nextIndex += 1
+
+      const run = await runOne(index)
+      runs[index] = run
+      onRun?.(run, index)
+    }
+  }
+
+  await Promise.all(Array.from({ length: maxParallelRuns }, () => worker()))
+
+  const orderedRuns = runs.filter((run): run is PromptRun => Boolean(run))
+  const scoredRuns = orderedRuns.filter((run) => run.status === 'completed' && run.evaluation.status === 'ok')
   const scores = scoredRuns.map((run) => run.evaluation.score)
   const averageScore = scores.length
     ? Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 10) / 10
@@ -428,11 +468,11 @@ export async function runPromptEvaluation(
     minScore: scores.length ? Math.min(...scores) : 0,
     maxScore: scores.length ? Math.max(...scores) : 0,
     completedRuns: scoredRuns.length,
-    failedRuns: runs.length - scoredRuns.length,
+    failedRuns: orderedRuns.length - scoredRuns.length,
     criticalFailures: scoredRuns.reduce((sum, run) => sum + run.evaluation.criticalFailures.length, 0),
     bestOutput: sorted.at(-1)?.output ?? '',
     worstOutput: sorted[0]?.output ?? '',
-    runs,
+    runs: orderedRuns,
   }
 }
 
@@ -467,6 +507,7 @@ async function repairRunCriterionSuggestion(
   return callOpenRouter({
     apiKey: runtime.apiKey,
     model: runtime.model,
+    sessionId: runtime.sessionId,
     temperature: 0,
     maxTokens: 1400,
     jsonMode: false,
@@ -555,6 +596,7 @@ Responda neste JSON:
     const content = await callOpenRouter({
       apiKey: runtime.apiKey,
       model: runtime.model,
+      sessionId: runtime.sessionId,
       temperature: 0,
       maxTokens: 1600,
       jsonMode: true,
@@ -566,12 +608,20 @@ Responda neste JSON:
     const parsed = parseJsonObject<EvaluationPayload>(content)
     return normalizeEvaluation(parsed)
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
+
     const firstError = error instanceof Error ? error.message : 'Falha desconhecida do avaliador.'
 
     try {
       const repaired = await repairEvaluation(runtime, messages.at(-1)?.content ?? '', firstError, signal)
       return normalizeEvaluation(parseJsonObject<EvaluationPayload>(repaired))
     } catch (repairError) {
+      if (isAbortError(repairError)) {
+        throw repairError
+      }
+
       const repairMessage = repairError instanceof Error ? repairError.message : 'Falha desconhecida ao reparar avaliação.'
 
       return {
@@ -607,6 +657,7 @@ async function repairEvaluation(
   return callOpenRouter({
     apiKey: runtime.apiKey,
     model: runtime.model,
+    sessionId: runtime.sessionId,
     temperature: 0,
     maxTokens: 1200,
     jsonMode: false,
