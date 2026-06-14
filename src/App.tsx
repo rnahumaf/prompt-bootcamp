@@ -105,6 +105,7 @@ function App() {
 
   const isRunning = status === 'running'
   const canSend = status === 'paused' || status === 'stopped' || status === 'done'
+  const sendLabel = status === 'paused' ? 'Continuar' : 'Enviar'
 
   const cleanInputs = useMemo(() => inputs.map((input) => input.trim()).filter(Boolean), [inputs])
   const currentFailedRuns = currentRuns.filter((run) => run.status !== 'completed').length
@@ -400,11 +401,13 @@ function App() {
 
       if (result.averageScore > activeBest.averageScore) {
         setBestResult(result)
+        setSeedPrompt(result.prompt)
+        setCurrentRuns(result.runs)
         setStatus('paused')
         appendLog(
           'avaliador',
-          'Melhora encontrada',
-          `Novo prompt: ${result.averageScore}/10 contra ${activeBest.averageScore}/10. A sessão pausou para revisão do diff.`,
+          'Melhora aplicada',
+          `Novo melhor prompt: ${result.averageScore}/10 contra ${activeBest.averageScore}/10. O campo de prompt foi atualizado e a sessão pausou para revisão.`,
         )
         return
       }
@@ -590,7 +593,7 @@ function App() {
               </button>
               <button type="button" className="secondary-button" onClick={continueSession} disabled={!canSend || isRunning}>
                 <Send size={15} />
-                Enviar
+                {sendLabel}
               </button>
             </div>
             {errorMessage ? <p className="error-text">{errorMessage}</p> : null}
@@ -776,7 +779,7 @@ function App() {
           <div className="diff-header">
             <div>
               <h2>Melhora encontrada</h2>
-              <p>Revise o diff. Use Enviar para continuar, parar ou orientar o próximo turno.</p>
+              <p>Revise o diff. Use Continuar para buscar outra melhoria, ou escreva uma orientação antes de continuar.</p>
             </div>
             <span className={scoreClass(bestResult.averageScore)}>{bestResult.averageScore}/10</span>
           </div>

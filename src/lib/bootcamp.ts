@@ -107,23 +107,27 @@ export async function createCandidatePrompt(
   userInstruction: string,
   signal?: AbortSignal,
 ): Promise<Candidate> {
-  const content = await callOpenRouter({
-    apiKey: runtime.apiKey,
-    model: runtime.model,
-    temperature: 0.45,
-    maxTokens: 2800,
-    jsonMode: true,
-    label: 'criador: candidato',
-    signal,
-    messages: [
-      {
-        role: 'system',
-        content:
-          'Você é o CRIADOR, um agente de melhoria de prompts em um sistema adversarial. Modifique prompts com parcimônia, preserve requisitos úteis e responda somente JSON válido.',
-      },
-      {
-        role: 'user',
-        content: `O prompt a ser melhorado atualmente é este:
+  let lastError: Error | null = null
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const content = await callOpenRouter({
+        apiKey: runtime.apiKey,
+        model: runtime.model,
+        temperature: attempt === 1 ? 0.45 : 0.2,
+        maxTokens: 3600,
+        jsonMode: true,
+        label: `criador: candidato tentativa ${attempt}`,
+        signal,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Você é o CRIADOR, um agente de melhoria de prompts em um sistema adversarial. Modifique prompts com parcimônia, preserve requisitos úteis e responda somente JSON válido.',
+          },
+          {
+            role: 'user',
+            content: `O prompt a ser melhorado atualmente é este:
 \`\`\`md
 ${best.prompt}
 \`\`\`
@@ -150,22 +154,35 @@ ${userInstruction || 'Sem instrução adicional.'}
 
 Agora modifique o SYSTEM PROMPT por meio de um DIFF conceitual e forneça também o prompt completo final, que será usado no próximo turno.
 
+IMPORTANTE:
+- Não proponha mudanças sobre o formato JSON da sua própria resposta.
+- Não responda com instruções como "remover bloco markdown", "corrigir JSON" ou "retornar JSON válido".
+- O campo "prompt" deve conter o SYSTEM PROMPT completo revisado, pronto para ser usado na execução dos próximos runs.
+- Preserve a tarefa original. A melhoria deve ser no prompt-alvo acima, não no protocolo desta chamada.
+
 Responda somente neste JSON:
 {
   "rationale": "mudança proposta em uma frase objetiva",
   "diff": "diff unificado ou lista objetiva de alterações",
   "prompt": "system prompt completo revisado"
 }`,
-      },
-    ],
-  })
+          },
+        ],
+      })
 
-  const parsed = await parseOrRepairCandidate(runtime, content, 'candidato', signal)
+      const parsed = await parseOrRepairCandidate(runtime, content, 'candidato', signal)
+      validateCandidatePrompt(parsed, best.prompt)
 
-  return {
-    ...parsed,
-    diff: parsed.diff || buildDiff(best.prompt, parsed.prompt),
+      return {
+        ...parsed,
+        diff: parsed.diff || buildDiff(best.prompt, parsed.prompt),
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error('Falha desconhecida ao criar candidato.')
+    }
   }
+
+  throw lastError ?? new Error('O CRIADOR não retornou candidato válido.')
 }
 
 export async function evaluateRunForCriteria(
@@ -261,6 +278,21 @@ function normalizeCandidate(parsed: CandidatePayload, label: string): Candidate 
   }
 }
 
+function validateCandidatePrompt(candidate: Candidate, previousPrompt: string) {
+  const prompt = candidate.prompt.trim()
+  const lowerJoined = `${candidate.rationale}\n${candidate.diff}\n${prompt}`.toLowerCase()
+  const looksLikeProtocolRepair =
+    /remover.*bloco.*(markdown|json)|corrigir.*json|json válido|retornar somente json|objeto json válido/.test(lowerJoined)
+
+  if (looksLikeProtocolRepair) {
+    throw new Error('O CRIADOR respondeu sobre o protocolo JSON, não sobre o system prompt alvo.')
+  }
+
+  if (previousPrompt.length > 600 && prompt.length < previousPrompt.length * 0.45) {
+    throw new Error('O CRIADOR retornou um prompt revisado curto demais para substituir o prompt atual.')
+  }
+}
+
 async function repairCandidate(
   runtime: Runtime,
   rawContent: string,
@@ -280,7 +312,7 @@ async function repairCandidate(
       {
         role: 'system',
         content:
-          'Você converte respostas de melhoria de prompt para JSON estrito. Preserve integralmente o prompt proposto. Responda somente um objeto JSON válido.',
+          'Você converte respostas de melhoria de prompt para JSON estrito. Preserve integralmente o prompt proposto. Não transforme erros de JSON em sugestão de prompt. Responda somente um objeto JSON válido.',
       },
       {
         role: 'user',
