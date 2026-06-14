@@ -5,17 +5,22 @@ import {
   Activity,
   Bot,
   Check,
+  ChevronDown,
+  ChevronUp,
   ClipboardList,
+  Copy,
   Diff,
   Download,
   KeyRound,
   Loader2,
+  Moon,
   Play,
   Plus,
   RotateCw,
   Send,
   ShieldCheck,
   Square,
+  Sun,
   Trash2,
   Upload,
   X,
@@ -101,6 +106,41 @@ function isAbortLikeError(error: unknown) {
 }
 
 function App() {
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const saved = localStorage.getItem('prompt-bootcamp-theme')
+    return (saved === 'dark' || saved === 'light') ? saved : 'light'
+  })
+  const [copied, setCopied] = useState(false)
+  const [collapsedPanels, setCollapsedPanels] = useState<Record<string, boolean>>({
+    config: false,
+    prompt: false,
+    criteria: false,
+    control: false,
+  })
+
+  const toggleTheme = () => {
+    setTheme((prev) => {
+      const next = prev === 'light' ? 'dark' : 'light'
+      localStorage.setItem('prompt-bootcamp-theme', next)
+      return next
+    })
+  }
+
+  const togglePanel = (key: string) => {
+    setCollapsedPanels((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const handleCopyPrompt = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+      appendLog('sistema', 'Prompt copiado', 'O melhor prompt foi copiado para a área de transferência.')
+    } catch (err) {
+      appendLog('sistema', 'Erro ao copiar', 'Não foi possível acessar a área de transferência.')
+    }
+  }
+
   const apiKeyRef = useRef('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [hasApiKey, setHasApiKey] = useState(false)
@@ -518,7 +558,7 @@ function App() {
   }, [bestResult, diffBefore])
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell theme-${theme}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark">PB</span>
@@ -527,15 +567,31 @@ function App() {
             <p>Otimização adversarial local com OpenRouter</p>
           </div>
         </div>
-        <div className={`status-pill status-${status}`}>
-          {isRunning ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}
-          <span>{statusLabel(status)}</span>
+        <div className="header-actions" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <button
+            type="button"
+            className="icon-button theme-toggle"
+            onClick={toggleTheme}
+            title={theme === 'light' ? 'Mudar para Dark Mode' : 'Mudar para Light Mode'}
+            aria-label="Alternar tema"
+          >
+            {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+          </button>
+          <div className={`status-pill status-${status}`}>
+            {isRunning ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}
+            <span>{statusLabel(status)}</span>
+          </div>
         </div>
       </header>
 
       <section className="workspace">
         <aside className="control-panel" aria-label="Configuração da sessão">
-          <Panel title="Chave e modelo" icon={<KeyRound size={17} />}>
+          <Panel
+            title="Chave e modelo"
+            icon={<KeyRound size={17} />}
+            collapsed={collapsedPanels.config}
+            onToggle={() => togglePanel('config')}
+          >
             <label>
               <span>OpenRouter API key</span>
               <input
@@ -550,13 +606,15 @@ function App() {
               <span className={hasApiKey ? 'key-loaded' : 'key-empty'}>
                 {hasApiKey ? 'Chave ativa em memória' : 'Nenhuma chave carregada'}
               </span>
-              <button type="button" className="secondary-button compact" onClick={loadApiKey} disabled={!apiKeyDraft.trim()}>
-                <KeyRound size={14} />
-                Usar chave
-              </button>
-              <button type="button" className="icon-button" onClick={clearApiKey} disabled={!hasApiKey} aria-label="Limpar chave">
-                <X size={15} />
-              </button>
+              <div className="key-actions" style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                <button type="button" className="secondary-button compact" onClick={loadApiKey} disabled={!apiKeyDraft.trim()}>
+                  <KeyRound size={14} />
+                  Usar chave
+                </button>
+                <button type="button" className="icon-button" onClick={clearApiKey} disabled={!hasApiKey} aria-label="Limpar chave" style={{ width: '30px', height: '30px' }}>
+                  <X size={15} />
+                </button>
+              </div>
             </div>
             <label>
               <span>Modelo padrão</span>
@@ -594,7 +652,12 @@ function App() {
             </div>
           </Panel>
 
-          <Panel title="Prompt e tarefa" icon={<Bot size={17} />}>
+          <Panel
+            title="Prompt e tarefa"
+            icon={<Bot size={17} />}
+            collapsed={collapsedPanels.prompt}
+            onToggle={() => togglePanel('prompt')}
+          >
             <label>
               <span>Prompt para melhoria</span>
               <textarea
@@ -610,7 +673,12 @@ function App() {
             </label>
           </Panel>
 
-          <Panel title="Critérios e inputs" icon={<ClipboardList size={17} />}>
+          <Panel
+            title="Critérios e inputs"
+            icon={<ClipboardList size={17} />}
+            collapsed={collapsedPanels.criteria}
+            onToggle={() => togglePanel('criteria')}
+          >
             <label>
               <span>Critérios de avaliação · v{criteriaVersion}</span>
               <textarea
@@ -629,10 +697,10 @@ function App() {
               {inputs.map((input, index) => (
                 <div className="input-item" key={`input-${index}`}>
                   <textarea
-                    value={input}
-                    onChange={(event) => updateInput(index, event.target.value)}
-                    rows={4}
-                    placeholder={`Input ${index + 1}`}
+                     value={input}
+                     onChange={(event) => updateInput(index, event.target.value)}
+                     rows={4}
+                     placeholder={`Input ${index + 1}`}
                   />
                   <button type="button" className="icon-button danger" onClick={() => removeInput(index)} aria-label="Remover input">
                     <Trash2 size={15} />
@@ -642,7 +710,12 @@ function App() {
             </div>
           </Panel>
 
-          <Panel title="Controle humano" icon={<Send size={17} />}>
+          <Panel
+            title="Controle humano"
+            icon={<Send size={17} />}
+            collapsed={collapsedPanels.control}
+            onToggle={() => togglePanel('control')}
+          >
             <textarea
               value={userInstruction}
               onChange={(event) => setUserInstruction(event.target.value)}
@@ -739,12 +812,23 @@ function App() {
             <AgentPanel title="MELHOR PROMPT" icon={<ClipboardList size={18} />} tone="best">
               {bestResult ? (
                 <>
-                  <div className="prompt-meta">
-                    <span>Média {bestResult.averageScore}/10</span>
-                    <span>Mín. {bestResult.minScore}/10</span>
-                    <span>Máx. {bestResult.maxScore}/10</span>
-                    <span>Válidos {bestResult.completedRuns}/{RUNS_PER_PROMPT}</span>
-                    <span>Falhas {bestResult.failedRuns}</span>
+                  <div className="prompt-meta" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <span>Média {bestResult.averageScore}/10</span>
+                      <span>Mín. {bestResult.minScore}/10</span>
+                      <span>Máx. {bestResult.maxScore}/10</span>
+                      <span>Válidos {bestResult.completedRuns}/{RUNS_PER_PROMPT}</span>
+                      <span>Falhas {bestResult.failedRuns}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button compact copy-prompt-btn"
+                      onClick={() => handleCopyPrompt(bestResult.prompt)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', minHeight: '28px', padding: '0 8px' }}
+                    >
+                      {copied ? <Check size={13} style={{ color: 'var(--success)' }} /> : <Copy size={13} />}
+                      <span>{copied ? 'Copiado!' : 'Copiar'}</span>
+                    </button>
                   </div>
                   <pre className="prompt-box">{bestResult.prompt}</pre>
                 </>
@@ -800,67 +884,93 @@ function App() {
       </section>
 
       {runSuggestion ? (
-        <section className="suggestion-drawer" aria-label="Sugestão do avaliador de run">
-          <div className="diff-header">
-            <div>
-              <h2>{runSuggestion.title}</h2>
-              <p>Escopo: {scopeLabel(runSuggestion.scope)}. Aceitar altera os critérios e reinicia a avaliação do zero.</p>
-            </div>
-            <button type="button" className="icon-button" onClick={rejectSuggestion} aria-label="Fechar sugestão">
-              <X size={15} />
-            </button>
-          </div>
-          <div className="suggestion-body">
-            <section>
-              <strong>Evidência</strong>
-              <p>{runSuggestion.evidence}</p>
-            </section>
-            <section>
-              <strong>Risco</strong>
-              <p>{runSuggestion.risk}</p>
-            </section>
-            <section>
-              <strong>Exemplo de pontuação</strong>
-              <p>{runSuggestion.scoringExample}</p>
-            </section>
-            <label>
-              <span>Critério proposto</span>
-              <textarea value={suggestionDraft} onChange={(event) => setSuggestionDraft(event.target.value)} rows={4} />
-            </label>
-            <div className="action-row">
-              <button type="button" className="primary-button" onClick={acceptSuggestion}>
-                <Check size={16} />
-                Aceitar e reiniciar
-              </button>
-              <button type="button" className="secondary-button" onClick={rejectSuggestion}>
-                <X size={15} />
-                Rejeitar
+        <div className="modal-overlay" onClick={rejectSuggestion}>
+          <div className="modal-container suggestion-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h2>{runSuggestion.title}</h2>
+                <p className="modal-subtitle">
+                  Escopo: <span className="badge">{scopeLabel(runSuggestion.scope)}</span> · Aceitar altera os critérios e reinicia a avaliação do zero.
+                </p>
+              </div>
+              <button type="button" className="icon-button close-modal" onClick={rejectSuggestion} aria-label="Fechar sugestão">
+                <X size={16} />
               </button>
             </div>
+            <div className="modal-body suggestion-body">
+              <div className="suggestion-grid">
+                <section className="evidence-section">
+                  <strong>Evidência</strong>
+                  <p>{runSuggestion.evidence}</p>
+                </section>
+                <section className="risk-section">
+                  <strong>Risco</strong>
+                  <p>{runSuggestion.risk}</p>
+                </section>
+                <section className="example-section">
+                  <strong>Exemplo de pontuação</strong>
+                  <p>{runSuggestion.scoringExample}</p>
+                </section>
+              </div>
+              <label className="modal-label">
+                <span>Critério proposto para adição</span>
+                <textarea value={suggestionDraft} onChange={(event) => setSuggestionDraft(event.target.value)} rows={4} />
+              </label>
+              <div className="modal-actions">
+                <button type="button" className="primary-button accept-btn" onClick={acceptSuggestion}>
+                  <Check size={16} />
+                  Aceitar e reiniciar
+                </button>
+                <button type="button" className="secondary-button reject-btn" onClick={rejectSuggestion}>
+                  <X size={15} />
+                  Rejeitar
+                </button>
+              </div>
+            </div>
           </div>
-        </section>
+        </div>
       ) : null}
 
       {status === 'paused' && bestResult ? (
-        <section className="diff-drawer" aria-label="Diff visual do prompt">
-          <div className="diff-header">
-            <div>
-              <h2>Melhora encontrada</h2>
-              <p>Revise o diff. Use Continuar para buscar outra melhoria, ou escreva uma orientação antes de continuar.</p>
+        <div className="modal-overlay" onClick={() => stop()}>
+          <div className="modal-container diff-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h2>Melhora encontrada</h2>
+                <p className="modal-subtitle">Revise as alterações do prompt no diff abaixo. Você pode continuar ou ajustar orientações.</p>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <span className={`score-badge ${scoreClass(bestResult.averageScore)}`}>
+                  {bestResult.averageScore}/10
+                </span>
+                <button type="button" className="icon-button close-modal" onClick={() => stop()} aria-label="Fechar diff">
+                  <X size={16} />
+                </button>
+              </div>
             </div>
-            <span className={scoreClass(bestResult.averageScore)}>{bestResult.averageScore}/10</span>
+            <div className="modal-body">
+              <div className="diff-grid">
+                {diffParts.map((part, index) => (
+                  <pre
+                    className={part.added ? 'diff-added' : part.removed ? 'diff-removed' : 'diff-context'}
+                    key={`diff-${index}`}
+                  >
+                    {part.value}
+                  </pre>
+                ))}
+              </div>
+              <div className="modal-actions" style={{ marginTop: '16px' }}>
+                <button type="button" className="primary-button" onClick={continueSession}>
+                  <Play size={16} />
+                  Continuar otimização
+                </button>
+                <button type="button" className="secondary-button" onClick={() => stop()}>
+                  Fechar visualização
+                </button>
+              </div>
+            </div>
           </div>
-          <div className="diff-grid">
-            {diffParts.map((part, index) => (
-              <pre
-                className={part.added ? 'diff-added' : part.removed ? 'diff-removed' : 'diff-context'}
-                key={`diff-${index}`}
-              >
-                {part.value}
-              </pre>
-            ))}
-          </div>
-        </section>
+        </div>
       ) : null}
     </main>
   )
@@ -899,14 +1009,33 @@ function scopeLabel(scope: RunCriterionSuggestion['scope']) {
   return labels[scope]
 }
 
-function Panel({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
+function Panel({
+  title,
+  icon,
+  children,
+  collapsed,
+  onToggle,
+}: {
+  title: string
+  icon: ReactNode
+  children: ReactNode
+  collapsed?: boolean
+  onToggle?: () => void
+}) {
   return (
-    <section className="panel">
-      <header>
-        {icon}
-        <h2>{title}</h2>
+    <section className={`panel ${collapsed ? 'collapsed' : ''}`}>
+      <header onClick={onToggle} style={{ cursor: onToggle ? 'pointer' : 'default', userSelect: 'none' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {icon}
+          <h2>{title}</h2>
+        </div>
+        {onToggle && (
+          <div className="collapse-icon">
+            {collapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+          </div>
+        )}
       </header>
-      <div className="panel-body">{children}</div>
+      {!collapsed && <div className="panel-body">{children}</div>}
     </section>
   )
 }
@@ -925,8 +1054,10 @@ function AgentPanel({
   return (
     <section className={`agent-panel ${tone}`}>
       <header>
-        {icon}
-        <h2>{title}</h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {icon}
+          <h2>{title}</h2>
+        </div>
       </header>
       <div className="agent-body">{children}</div>
     </section>
