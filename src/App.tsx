@@ -93,6 +93,13 @@ function updateRunSlot(runs: PromptRun[], run: PromptRun, index: number) {
     .sort((left, right) => (left.runNumber ?? 0) - (right.runNumber ?? 0))
 }
 
+function isAbortLikeError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && /abort|interrompida/i.test(error.message))
+  )
+}
+
 function App() {
   const apiKeyRef = useRef('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
@@ -413,7 +420,24 @@ function App() {
 
     while (inferiorTurns < 3) {
       appendLog('criador', `Turno ${history.length + inferiorTurns + 1}`, 'Criando um candidato por diff conceitual.')
-      const candidate = await createCandidatePrompt(config, activeBest, original, instruction, controller.signal)
+      let candidate: Candidate
+
+      try {
+        candidate = await createCandidatePrompt(config, activeBest, original, instruction, controller.signal)
+      } catch (error) {
+        if (isAbortLikeError(error)) {
+          throw error
+        }
+
+        inferiorTurns += 1
+        appendLog(
+          'criador',
+          'Candidato inválido',
+          `${error instanceof Error ? error.message : 'O CRIADOR não retornou candidato aproveitável.'} Tentativa descartada ${inferiorTurns}/3.`,
+        )
+        continue
+      }
+
       setLastCandidate(candidate)
       setDiffBefore(activeBest.prompt)
       setCurrentRuns([])
@@ -451,11 +475,11 @@ function App() {
     }
 
     setStatus('done')
-    appendLog('sistema', 'Sem melhora suficiente', 'Três turnos consecutivos não superaram o melhor prompt atual.')
+    appendLog('sistema', 'Sem melhora suficiente', 'Três tentativas consecutivas não produziram um candidato aproveitável melhor que o prompt atual.')
   }
 
   function handleRuntimeError(error: unknown) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (isAbortLikeError(error)) {
       setStatus('stopped')
       appendLog('sistema', 'Execução interrompida', 'As chamadas em andamento foram canceladas.')
       return

@@ -170,6 +170,8 @@ IMPORTANTE:
 - Não proponha mudanças sobre o formato JSON da sua própria resposta.
 - Não responda com instruções como "remover bloco markdown", "corrigir JSON" ou "retornar JSON válido".
 - O campo "prompt" deve conter o SYSTEM PROMPT completo revisado, pronto para ser usado na execução dos próximos runs.
+- O campo "prompt" não deve mencionar os campos "prompt", "rationale" ou "diff" desta chamada interna.
+- O campo "prompt" deve preservar o domínio e a tarefa do prompt-alvo, sem virar uma instrução genérica de formatação da resposta JSON.
 - Preserve a tarefa original. A melhoria deve ser no prompt-alvo acima, não no protocolo desta chamada.
 
 Responda somente neste JSON:
@@ -297,9 +299,11 @@ function normalizeCandidate(parsed: CandidatePayload, label: string): Candidate 
 
 function validateCandidatePrompt(candidate: Candidate, previousPrompt: string) {
   const prompt = candidate.prompt.trim()
-  const lowerJoined = `${candidate.rationale}\n${candidate.diff}\n${prompt}`.toLowerCase()
+  const lowerPrompt = prompt.toLowerCase()
   const looksLikeProtocolRepair =
-    /remover.*bloco.*(markdown|json)|corrigir.*json|json válido|retornar somente json|objeto json válido/.test(lowerJoined)
+    /campo\s+"?prompt"?|campo\s+"?rationale"?|campo\s+"?diff"?|não proponha mudanças sobre o formato json|remover.*bloco.*(markdown|json)|corrigir.*json|retornar somente json|objeto json válido/.test(
+      lowerPrompt,
+    )
 
   if (looksLikeProtocolRepair) {
     throw new Error('O CRIADOR respondeu sobre o protocolo JSON, não sobre o system prompt alvo.')
