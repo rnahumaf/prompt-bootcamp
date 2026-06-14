@@ -131,8 +131,8 @@ function App() {
   const importInputRef = useRef<HTMLInputElement | null>(null)
 
   const isRunning = status === 'running'
-  const canSend = status === 'paused' || status === 'stopped' || status === 'done'
-  const sendLabel = status === 'paused' ? 'Continuar' : 'Enviar'
+  const canSend = status === 'paused' || status === 'stopped' || status === 'done' || (status === 'error' && Boolean(bestResult && originalResult))
+  const sendLabel = status === 'paused' ? 'Continuar' : status === 'error' ? 'Retomar' : 'Enviar'
 
   const cleanInputs = useMemo(() => inputs.map((input) => input.trim()).filter(Boolean), [inputs])
   const currentFailedRuns = currentRuns.filter((run) => run.status !== 'completed').length
