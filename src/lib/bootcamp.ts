@@ -17,10 +17,16 @@ type Runtime = Pick<
   'apiKey' | 'model' | 'maxParallelRuns' | 'sessionId' | 'taskInstructions' | 'evaluationCriteria' | 'inputs'
 >
 
+type PatchPayload = {
+  find: string
+  replace: string
+}
+
 type CandidatePayload = {
   prompt?: string
   rationale?: string
   diff?: string
+  patches?: PatchPayload[]
 }
 
 type EvaluationPayload = Partial<Evaluation>
@@ -52,6 +58,46 @@ function formatScore(result?: PromptResult) {
     null,
     2,
   )
+}
+
+export function applyPatches(prompt: string, patches: PatchPayload[]): string {
+  let updatedPrompt = prompt
+
+  for (const patch of patches) {
+    const findText = patch.find.trim()
+    const replaceText = patch.replace.trim()
+
+    if (!findText) continue
+
+    // 1. Tenta correspondência exata simples
+    if (updatedPrompt.includes(findText)) {
+      updatedPrompt = updatedPrompt.replace(findText, replaceText)
+      continue
+    }
+
+    // 2. Se falhar, tenta normalizar espaços e quebras de linha usando regex
+    const normalizeText = (txt: string) => txt.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()
+    const normalizedPrompt = normalizeText(updatedPrompt)
+    const normalizedFind = normalizeText(findText)
+
+    if (normalizedPrompt.includes(normalizedFind)) {
+      // Escapa caracteres especiais de regex
+      const escapedFind = findText
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        .replace(/\s+/g, '\\s+') // Permite qualquer tipo/quantidade de espaços/novas linhas
+
+      const regex = new RegExp(escapedFind, 'm')
+      if (regex.test(updatedPrompt)) {
+        updatedPrompt = updatedPrompt.replace(regex, replaceText)
+        continue
+      }
+    }
+
+    // Se falhar de vez, lança erro descritivo
+    throw new Error(`Trecho a substituir não encontrado no prompt atual. Copie exatamente o trecho caractere por caractere. Falhou ao buscar:\n"${findText.slice(0, 100)}..."`)
+  }
+
+  return updatedPrompt
 }
 
 function buildDiff(before: string, after: string) {
@@ -97,11 +143,10 @@ ${runtime.evaluationCriteria}
 INPUTS DE TESTE:
 ${runtime.inputs.map((input, index) => `[${index + 1}] ${input}`).join('\n\n')}
 
-Responda neste formato:
+Responda neste formato JSON:
 {
   "prompt": "system prompt completo em PT-BR",
-  "rationale": "explicação curta do desenho do prompt",
-  "diff": "PROMPT NOVO DO ZERO"
+  "rationale": "explicação curta do desenho do prompt"
 }`,
       },
     ],
@@ -111,35 +156,86 @@ Responda neste formato:
   return parsed.prompt
 }
 
+function buildErrorDiagnostic(best: PromptResult): string {
+  if (!best.runs || best.runs.length === 0) {
+    return 'Nenhum run disponível para análise no turno anterior.'
+  }
+
+  // Filtrar os runs concluídos com avaliação válida
+  const completedRuns = best.runs.filter(
+    (run) => run.status === 'completed' && run.evaluation.status === 'ok'
+  )
+
+  if (completedRuns.length === 0) {
+    return 'Nenhum run foi concluído com sucesso para análise de feedback.'
+  }
+
+  // Ordenamos de forma crescente pela nota (piores notas primeiro)
+  const sortedRuns = [...completedRuns].sort((a, b) => a.evaluation.score - b.evaluation.score)
+  
+  // Selecionamos os 3 piores runs para diagnóstico
+  const targetRuns = sortedRuns.slice(0, 3)
+
+  return targetRuns
+    .map((run, idx) => {
+      const evalData = run.evaluation
+      const failedCriteria = evalData.items
+        .filter((item) => item.score < item.max)
+        .map((item) => `- Critério: "${item.criterion}" | Pontuação: ${item.score}/${item.max} | Motivo: ${item.reason}`)
+        .join('\n')
+
+      const criticals = evalData.criticalFailures && evalData.criticalFailures.length > 0
+        ? `- Falhas Críticas: ${evalData.criticalFailures.join('; ')}`
+        : ''
+
+      return `--- CASO DE FALHA OU PONTUAÇÃO BAIXA ${idx + 1} (Input de Teste #${run.inputIndex + 1}) ---
+INPUT DE TESTE:
+"""
+${run.input}
+"""
+
+OUTPUT GERADO DO RUN:
+"""
+${run.output}
+"""
+
+DIAGNÓSTICO DA AVALIAÇÃO (Nota: ${evalData.score}/10):
+${evalData.summary}
+${criticals}
+${failedCriteria ? `Critérios não atendidos:\n${failedCriteria}` : 'Todos os critérios individuais foram atendidos nesta execução.'}
+`
+    })
+    .join('\n\n')
+}
+
 export async function createCandidatePrompt(
   runtime: Runtime,
   best: PromptResult,
   original: PromptResult,
   userInstruction: string,
+  messagesHistory: { role: 'system' | 'user' | 'assistant'; content: string }[],
+  lastEvaluationResult: PromptResult | null,
+  wasAccepted: boolean,
   signal?: AbortSignal,
-): Promise<Candidate> {
+): Promise<{ candidate: Candidate; updatedHistory: { role: 'system' | 'user' | 'assistant'; content: string }[] }> {
   let lastError: Error | null = null
+  let lastRawContent: string | null = null
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const content = await callOpenRouter({
-        apiKey: runtime.apiKey,
-        model: runtime.model,
-        sessionId: runtime.sessionId,
-        temperature: attempt === 1 ? 0.45 : 0.2,
-        maxTokens: 3600,
-        jsonMode: true,
-        label: `criador: candidato tentativa ${attempt}`,
-        signal,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Você é o CRIADOR, um agente de melhoria de prompts em um sistema adversarial. Modifique prompts com parcimônia, preserve requisitos úteis e responda somente JSON válido.',
-          },
-          {
-            role: 'user',
-            content: `O prompt a ser melhorado atualmente é este:
+  const messages = [...messagesHistory]
+
+  if (messages.length === 0) {
+    messages.push({
+      role: 'system',
+      content:
+        'Você é o CRIADOR, um agente de melhoria de prompts. Sua resposta DEVE ser estritamente um objeto JSON válido com exatamente duas chaves ("rationale" e "patches"). Você não deve gerar explicações, introduções ou blocos markdown de código fora do JSON. Responda apenas o JSON solicitado.',
+    })
+
+    messages.push({
+      role: 'user',
+      content: `Crie uma estratégia de melhoria para o SYSTEM PROMPT atual.
+Você deve propor modificações cirúrgicas por meio de blocos de substituição de texto (patches) simples no prompt atual.
+
+SYSTEM PROMPT ATUAL:
 \`\`\`md
 ${best.prompt}
 \`\`\`
@@ -150,10 +246,8 @@ ${formatScore(best)}
 Nota do prompt original para comparação:
 ${formatScore(original)}
 
-Veja um exemplo do pior output do melhor prompt atual:
-\`\`\`txt
-${best.worstOutput || 'AINDA SEM OUTPUT, ESTE É O PRIMEIRO TURNO'}
-\`\`\`
+DIAGNÓSTICO INICIAL (Análise das piores execuções do melhor prompt atual):
+${buildErrorDiagnostic(best)}
 
 Tarefa do usuário:
 ${runtime.taskInstructions}
@@ -164,39 +258,156 @@ ${runtime.evaluationCriteria}
 Instrução humana adicional:
 ${userInstruction || 'Sem instrução adicional.'}
 
-Agora modifique o SYSTEM PROMPT por meio de um DIFF conceitual e forneça também o prompt completo final, que será usado no próximo turno.
+Por favor, proponha o primeiro conjunto de alterações cirúrgicas. Identifique as regras ou seções que estão falhando no diagnóstico acima e substitua-as para melhorar a pontuação geral.
 
 IMPORTANTE:
-- Não proponha mudanças sobre o formato JSON da sua própria resposta.
-- Não responda com instruções como "remover bloco markdown", "corrigir JSON" ou "retornar JSON válido".
-- O campo "prompt" deve conter o SYSTEM PROMPT completo revisado, pronto para ser usado na execução dos próximos runs.
-- O campo "prompt" não deve mencionar os campos "prompt", "rationale" ou "diff" desta chamada interna.
-- O campo "prompt" deve preservar o domínio e a tarefa do prompt-alvo, sem virar uma instrução genérica de formatação da resposta JSON.
-- Preserve a tarefa original. A melhoria deve ser no prompt-alvo acima, não no protocolo desta chamada.
+- Você não reescreve o prompt completo. Em vez disso, retorne um array de "patches" indicando o trecho exato a ser localizado ("find") e o novo texto ("replace").
+- O trecho "find" deve ser copiado CARACTERE POR CARACTERE, exatamente como aparece no prompt atual, incluindo pontuações, títulos de seções e quebras de linha.
+- Se o trecho a localizar não for encontrado de forma exata, a modificação falhará.
+- Mantenha os patches focados nas falhas apontadas no diagnóstico.
 
-Responda somente neste JSON:
+Responda estritamente neste formato JSON:
 {
-  "rationale": "mudança proposta em uma frase objetiva",
-  "diff": "diff unificado ou lista objetiva de alterações",
-  "prompt": "system prompt completo revisado"
+  "rationale": "explicação curta da alteração",
+  "patches": [
+    {
+      "find": "texto exato a ser substituído",
+      "replace": "novo texto"
+    }
+  ]
+}
+
+Exemplo de resposta válida:
+{
+  "rationale": "Reforçada a regra de concisão nos títulos de encaminhamentos.",
+  "patches": [
+    {
+      "find": "11. Antes de cada bloco, usar título em caixa alta:\\n    - \`ENCAMINHAMENTO [ESPECIALIDADE OU SERVIÇO] - [GRAU DE PRIORIDADE]\`",
+      "replace": "11. Antes de cada bloco, usar título curto em caixa alta:\\n    - \`ENCAMINHAMENTO [ESPECIALIDADE] - [GRAU DE PRIORIDADE]\`"
+    }
+  ]
 }`,
-          },
-        ],
+    })
+  } else if (lastEvaluationResult) {
+    let feedbackContent = ''
+    if (wasAccepted) {
+      feedbackContent = `O patch anterior foi APROVADO e aplicado ao prompt! A nota média subiu para ${lastEvaluationResult.averageScore}/10 (melhor nota atual).
+
+Aqui está o novo diagnóstico das piores execuções do prompt atualizado:
+${buildErrorDiagnostic(lastEvaluationResult)}
+
+Instrução humana adicional para este turno: ${userInstruction || 'Sem instrução adicional.'}
+
+Por favor, proponha o próximo patch incremental (ou array de patches) em cima do prompt atualizado para continuar evoluindo o desempenho.
+
+Responda apenas com o JSON contendo "rationale" e "patches".`
+    } else {
+      feedbackContent = `O patch anterior foi REJEITADO porque não melhorou a nota geral (obteve nota média ${lastEvaluationResult.averageScore}/10, que não superou o melhor anterior de ${best.averageScore}/10).
+
+Abaixo está o diagnóstico das execuções do candidato que foi rejeitado:
+${buildErrorDiagnostic(lastEvaluationResult)}
+
+Por favor, ignore o patch anterior, retorne ao estado anterior do prompt, e proponha uma estratégia de patch DIFERENTE para corrigir os erros que continuam ocorrendo.
+
+Instrução humana adicional para este turno: ${userInstruction || 'Sem instrução adicional.'}
+
+Responda apenas com o JSON contendo "rationale" e "patches".`
+    }
+
+    messages.push({
+      role: 'user',
+      content: feedbackContent,
+    })
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      if (attempt > 1 && lastRawContent && lastError) {
+        messages.push({
+          role: 'assistant',
+          content: lastRawContent,
+        })
+        messages.push({
+          role: 'user',
+          content: `Sua resposta anterior não pôde ser processada porque falhou no parsing de JSON ou na correspondência do patch.
+Erro observado: ${lastError.message}
+
+Por favor, corrija. Lembre-se de que a correspondência de texto para substituir ("find") deve ser exata.
+Retorne apenas o JSON correto:
+{
+  "rationale": "explicação curta",
+  "patches": [
+    {
+      "find": "trecho exato a ser substituído",
+      "replace": "novo texto"
+    }
+  ]
+}`,
+        })
+      }
+
+      const content = await callOpenRouter({
+        apiKey: runtime.apiKey,
+        model: runtime.model,
+        sessionId: runtime.sessionId,
+        temperature: attempt === 1 ? 0.2 : 0.1,
+        maxTokens: 3200,
+        jsonMode: true,
+        label: `criador: candidato tentativa ${attempt}`,
+        signal,
+        messages,
       })
 
-      const parsed = await parseOrRepairCandidate(runtime, content, 'candidato', signal)
-      validateCandidatePrompt(parsed, best.prompt)
+      lastRawContent = content
+
+      let parsed: CandidatePayload
+      try {
+        parsed = parseJsonObject<CandidatePayload>(content)
+      } catch (parseErr) {
+        const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr)
+        console.error(`[CRIADOR] Falha de JSON na tentativa ${attempt}. Erro: ${errMsg}\nResposta bruta recebida:\n${content}`)
+        throw new Error(`Resposta não contém JSON válido. Detalhes: ${errMsg}`)
+      }
+
+      let updatedPrompt = best.prompt
+      if (parsed.patches && parsed.patches.length > 0) {
+        try {
+          updatedPrompt = applyPatches(best.prompt, parsed.patches)
+        } catch (patchErr) {
+          const errMsg = patchErr instanceof Error ? patchErr.message : String(patchErr)
+          console.error(`[CRIADOR] Falha ao aplicar patches na tentativa ${attempt}. Erro: ${errMsg}`)
+          throw new Error(`Falha ao aplicar patches. Detalhes: ${errMsg}`)
+        }
+      } else if (parsed.prompt) {
+        updatedPrompt = parsed.prompt
+        validateCandidatePrompt({
+          prompt: updatedPrompt,
+          rationale: parsed.rationale || '',
+          diff: '',
+        }, best.prompt)
+      } else {
+        throw new Error('Nenhum patch ou prompt completo foi retornado pelo CRIADOR no JSON.')
+      }
+
+      messages.push({
+        role: 'assistant',
+        content,
+      })
 
       return {
-        ...parsed,
-        diff: parsed.diff || buildDiff(best.prompt, parsed.prompt),
+        candidate: {
+          prompt: updatedPrompt,
+          rationale: parsed.rationale?.trim() || 'Melhoria incremental do prompt.',
+          diff: buildDiff(best.prompt, updatedPrompt),
+        },
+        updatedHistory: messages,
       }
     } catch (error) {
       if (isAbortError(error)) {
         throw error
       }
 
-      lastError = error instanceof Error ? error : new Error('Falha desconhecida ao criar candidato.')
+      lastError = error instanceof Error ? error : new Error('Falha desconhecida ao propor candidato.')
     }
   }
 
@@ -271,6 +482,36 @@ Responda neste JSON:
   }
 }
 
+function extractPromptFromRawText(content: string): string | null {
+  const trimmed = content.trim()
+  if (!trimmed) return null
+
+  // Heurística 1: Tenta encontrar blocos markdown ```md ... ``` ou ``` ... ```
+  const blocks = [...trimmed.matchAll(/```(?:md|markdown)?\s*([\s\S]*?)```/gi)]
+  if (blocks.length > 0) {
+    let longestBlock = ''
+    for (const match of blocks) {
+      const blockContent = match[1].trim()
+      if (blockContent.length > longestBlock.length) {
+        longestBlock = blockContent
+      }
+    }
+    if (longestBlock.length > 50) {
+      return longestBlock
+    }
+  }
+
+  // Heurística 2: Se não houver blocos, mas o texto for longo e começar com algo parecido com prompt
+  let cleaned = trimmed
+  cleaned = cleaned.replace(/^(claro|com certeza|aqui está|segue|este é|conforme solicitado|system prompt)[\s\S]*?:\s*/i, '')
+  
+  if (cleaned.length > 100) {
+    return cleaned
+  }
+
+  return null
+}
+
 async function parseOrRepairCandidate(
   runtime: Runtime,
   content: string,
@@ -280,8 +521,21 @@ async function parseOrRepairCandidate(
   try {
     return normalizeCandidate(parseJsonObject<CandidatePayload>(content), label)
   } catch (error) {
-    const repaired = await repairCandidate(runtime, content, error instanceof Error ? error.message : 'JSON inválido.', label, signal)
-    return normalizeCandidate(parseJsonObject<CandidatePayload>(repaired), `${label} reparado`)
+    try {
+      const repaired = await repairCandidate(runtime, content, error instanceof Error ? error.message : 'JSON inválido.', label, signal)
+      return normalizeCandidate(parseJsonObject<CandidatePayload>(repaired), `${label} reparado`)
+    } catch (repairError) {
+      console.warn(`[CRIADOR] O reparo de JSON falhou. Tentando extração de prompt do conteúdo bruto.`)
+      const extractedPrompt = extractPromptFromRawText(content)
+      if (extractedPrompt) {
+        return {
+          prompt: extractedPrompt,
+          rationale: 'Melhoria direta do prompt (modelo respondeu em texto livre).',
+          diff: '',
+        }
+      }
+      throw repairError
+    }
   }
 }
 
@@ -327,24 +581,23 @@ async function repairCandidate(
     sessionId: runtime.sessionId,
     temperature: 0,
     maxTokens: 3200,
-    jsonMode: false,
+    jsonMode: true,
     label: `criador: reparo JSON ${label}`,
     signal,
     messages: [
       {
         role: 'system',
         content:
-          'Você converte respostas de melhoria de prompt para JSON estrito. Preserve integralmente o prompt proposto. Não transforme erros de JSON em sugestão de prompt. Responda somente um objeto JSON válido.',
+          'Você converte respostas de melhoria de prompt para JSON estrito. Responda somente um objeto JSON válido.',
       },
       {
         role: 'user',
         content: `A resposta abaixo deveria ser JSON, mas falhou com este erro:
 ${errorMessage}
 
-Converta para este formato:
+Converta para este formato JSON:
 {
   "rationale": "mudança proposta em uma frase objetiva",
-  "diff": "diff unificado ou lista objetiva de alterações",
   "prompt": "system prompt completo"
 }
 

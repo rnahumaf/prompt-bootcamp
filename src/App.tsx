@@ -162,6 +162,7 @@ function App() {
   const [originalResult, setOriginalResult] = useState<PromptResult | null>(null)
   const [bestResult, setBestResult] = useState<PromptResult | null>(null)
   const [lastCandidate, setLastCandidate] = useState<Candidate | null>(null)
+  const [creatorMessages, setCreatorMessages] = useState<any[]>([])
   const [diffBefore, setDiffBefore] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [runSuggestion, setRunSuggestion] = useState<RunCriterionSuggestion | null>(null)
@@ -192,6 +193,7 @@ function App() {
     setBestResult(null)
     setLastCandidate(null)
     setDiffBefore('')
+    setCreatorMessages([])
     setStatus('idle')
     setErrorMessage('')
     appendLog('criterios', 'Critérios atualizados', 'As notas anteriores foram arquivadas implicitamente; reinicie a avaliação do zero.')
@@ -384,6 +386,7 @@ function App() {
       setOriginalResult(null)
       setBestResult(null)
       setLastCandidate(null)
+      setCreatorMessages([])
       setDiffBefore('')
       appendLog(
         'sistema',
@@ -455,15 +458,33 @@ function App() {
     instruction: string,
     controller: AbortController,
   ) {
-    const activeBest = currentBest
+    let activeBest = currentBest
     let inferiorTurns = 0
+    let localMessages = [...creatorMessages]
+
+    let lastEvaluationResult: PromptResult | null = null
+    let wasAccepted = false
 
     while (inferiorTurns < 3) {
-      appendLog('criador', `Turno ${history.length + inferiorTurns + 1}`, 'Criando um candidato por diff conceitual.')
+      const turnNum = history.length + inferiorTurns + 1
+      appendLog('criador', `Turno ${turnNum}`, 'Gerando patch incremental com otimização.')
       let candidate: Candidate
 
       try {
-        candidate = await createCandidatePrompt(config, activeBest, original, instruction, controller.signal)
+        const response = await createCandidatePrompt(
+          config,
+          activeBest,
+          original,
+          instruction,
+          localMessages,
+          lastEvaluationResult,
+          wasAccepted,
+          controller.signal,
+        )
+
+        candidate = response.candidate
+        localMessages = response.updatedHistory
+        setCreatorMessages(localMessages)
       } catch (error) {
         if (isAbortLikeError(error)) {
           throw error
@@ -475,25 +496,30 @@ function App() {
           'Candidato inválido',
           `${error instanceof Error ? error.message : 'O CRIADOR não retornou candidato aproveitável.'} Tentativa descartada ${inferiorTurns}/3.`,
         )
+        lastEvaluationResult = null
+        wasAccepted = false
         continue
       }
 
       setLastCandidate(candidate)
       setDiffBefore(activeBest.prompt)
       setCurrentRuns([])
-      appendLog('criador', 'Candidato pronto', candidate.rationale)
+      appendLog('criador', 'Patch pronto', candidate.rationale)
 
       const result = await runPromptEvaluation(
         config,
         candidate.prompt,
-        `Candidato ${history.length + inferiorTurns + 1}`,
+        `Candidato ${turnNum}`,
         (run, index) => setCurrentRuns((runs) => updateRunSlot(runs, run, index)),
         controller.signal,
       )
 
       setHistory((items) => [result, ...items])
+      lastEvaluationResult = result
 
       if (result.averageScore > activeBest.averageScore) {
+        wasAccepted = true
+        activeBest = result
         setBestResult(result)
         setSeedPrompt(result.prompt)
         setCurrentRuns(result.runs)
@@ -501,11 +527,12 @@ function App() {
         appendLog(
           'avaliador',
           'Melhora aplicada',
-          `Novo melhor prompt: ${result.averageScore}/10 contra ${activeBest.averageScore}/10. O campo de prompt foi atualizado e a sessão pausou para revisão.`,
+          `Novo melhor prompt: ${result.averageScore}/10 contra ${diffBefore ? 'anterior' : 'original'}. O prompt foi atualizado e a sessão pausou para revisão.`,
         )
         return
       }
 
+      wasAccepted = false
       inferiorTurns += 1
       appendLog(
         'avaliador',
@@ -515,7 +542,7 @@ function App() {
     }
 
     setStatus('done')
-    appendLog('sistema', 'Sem melhora suficiente', 'Três tentativas consecutivas não produziram um candidato aproveitável melhor que o prompt atual.')
+    appendLog('sistema', 'Sem melhora suficiente', 'Três tentativas consecutivas não responderam com melhora ao prompt atual.')
   }
 
   function handleRuntimeError(error: unknown) {
