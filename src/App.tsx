@@ -2,12 +2,10 @@ import { useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { diffLines } from 'diff'
 import {
-  Activity,
   Bot,
   Check,
   ChevronDown,
   ChevronUp,
-  ClipboardList,
   Copy,
   Diff,
   Download,
@@ -18,7 +16,6 @@ import {
   Plus,
   RotateCw,
   Send,
-  ShieldCheck,
   Square,
   Sun,
   Trash2,
@@ -26,34 +23,40 @@ import {
   X,
 } from 'lucide-react'
 import './App.css'
-import {
-  createCandidatePrompt,
-  createInitialPrompt,
-  evaluateRunForCriteria,
-  runPromptEvaluation,
-} from './lib/bootcamp'
-import { DEFAULT_MODEL, RUNS_PER_PROMPT } from './types'
+import { generatePromptOutput, revisePromptFromFeedback } from './lib/bootcamp'
+import { DEFAULT_MODEL } from './types'
 import type {
-  BootcampConfig,
-  Candidate,
+  AgentName,
+  InputSelectionMode,
   LogEntry,
   ProgressExport,
-  PromptResult,
-  PromptRun,
-  RunCriterionSuggestion,
+  PromptTrainingConfig,
   Status,
+  TrainingMode,
+  TrainingRun,
+  TrainingTurnHistory,
 } from './types'
 
-const starterCriteria = `- O output deve cumprir exatamente o formato solicitado pelo usuário.
-- O output deve ser conciso e não incluir informações irrelevantes.
-- O output não deve inventar dados ausentes no input.
-- O output deve usar PT-BR natural, sem vocabulário artificial ou estrangeirismos desnecessários.
-- Se houver limite de caracteres, ele deve ser respeitado.
-- Markdown deve ser válido quando solicitado.`
+const starterTask = 'Melhorar um system prompt a partir de outputs gerados e correções humanas sucessivas.'
 
-const starterTask = `Melhorar um system prompt para gerar respostas mais consistentes, curtas, claras e aderentes aos critérios definidos.`
+const starterPrompt = `Você é um assistente objetivo e preciso.
+Responda em PT-BR natural.
+Siga exatamente a tarefa pedida pelo usuário.
+Não invente informações ausentes.`
 
-const starterInput = `encaminhamento à dermatologia: paciente com lesão descamativa em couro cabeludo há 4 meses, prurido, sem melhora com shampoo comum. Solicitar avaliação especializada e incluir CID provável.`
+const starterInput = 'Crie um resumo curto para uma pessoa que precisa entender rapidamente o próximo passo.'
+
+type LegacyProgressExport = {
+  schemaVersion?: 2 | 3
+  model?: string
+  sessionId?: string
+  seedPrompt?: string
+  taskInstructions?: string
+  inputs?: string[]
+  bestResult?: { prompt?: string } | null
+  lastCandidate?: { prompt?: string } | null
+  logs?: LogEntry[]
+}
 
 function nowLabel() {
   return new Intl.DateTimeFormat('pt-BR', {
@@ -67,7 +70,7 @@ function makeSessionId() {
   return `prompt-bootcamp-${Date.now()}-${Math.random().toString(16).slice(2)}`.slice(0, 120)
 }
 
-function makeLog(agent: LogEntry['agent'], title: string, body: string): LogEntry {
+function makeLog(agent: AgentName, title: string, body: string): LogEntry {
   return {
     id: `${agent}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     agent,
@@ -77,25 +80,8 @@ function makeLog(agent: LogEntry['agent'], title: string, body: string): LogEntr
   }
 }
 
-function scoreClass(score?: number) {
-  if (score === undefined) return 'score-muted'
-  if (score >= 8) return 'score-good'
-  if (score >= 6) return 'score-mid'
-  return 'score-bad'
-}
-
-function clampParallelRuns(value: unknown) {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return RUNS_PER_PROMPT
-  return Math.max(1, Math.min(RUNS_PER_PROMPT, Math.round(numeric)))
-}
-
-function updateRunSlot(runs: PromptRun[], run: PromptRun, index: number) {
-  const runNumber = run.runNumber ?? index + 1
-  return runs
-    .filter((item) => (item.runNumber ?? 0) !== runNumber)
-    .concat({ ...run, runNumber })
-    .sort((left, right) => (left.runNumber ?? 0) - (right.runNumber ?? 0))
+function makeRunId() {
+  return `run-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 function isAbortLikeError(error: unknown) {
@@ -105,20 +91,66 @@ function isAbortLikeError(error: unknown) {
   )
 }
 
+function splitInputs(inputs: string[]) {
+  return inputs.map((input) => input.trim()).filter(Boolean)
+}
+
+function randomInputIndex(inputs: string[]) {
+  return Math.floor(Math.random() * inputs.length)
+}
+
 function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('prompt-bootcamp-theme')
-    return (saved === 'dark' || saved === 'light') ? saved : 'light'
+    return saved === 'dark' || saved === 'light' ? saved : 'light'
   })
-  const [copied, setCopied] = useState(false)
   const [collapsedPanels, setCollapsedPanels] = useState<Record<string, boolean>>({
     config: false,
     prompt: false,
-    criteria: false,
-    control: false,
+    inputs: false,
+    feedback: false,
   })
+  const [copied, setCopied] = useState(false)
 
-  const toggleTheme = () => {
+  const apiKeyRef = useRef('')
+  const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [hasApiKey, setHasApiKey] = useState(false)
+  const [model, setModel] = useState(DEFAULT_MODEL)
+  const [sessionId, setSessionId] = useState(makeSessionId)
+  const [mode, setMode] = useState<TrainingMode>('sem-input')
+  const [inputSelectionMode, setInputSelectionMode] = useState<InputSelectionMode>('aleatorio')
+  const [seedPrompt, setSeedPrompt] = useState(starterPrompt)
+  const [currentPrompt, setCurrentPrompt] = useState(starterPrompt)
+  const [originalPrompt, setOriginalPrompt] = useState('')
+  const [taskInstructions, setTaskInstructions] = useState(starterTask)
+  const [inputs, setInputs] = useState([starterInput])
+  const [activeRun, setActiveRun] = useState<TrainingRun | null>(null)
+  const [history, setHistory] = useState<TrainingTurnHistory[]>([])
+  const [editedOutput, setEditedOutput] = useState('')
+  const [comment, setComment] = useState('')
+  const [lastDiff, setLastDiff] = useState('')
+  const [lastPatchBefore, setLastPatchBefore] = useState('')
+  const [lastRationale, setLastRationale] = useState('')
+  const [status, setStatus] = useState<Status>('idle')
+  const [errorMessage, setErrorMessage] = useState('')
+  const [logs, setLogs] = useState<LogEntry[]>([
+    makeLog('sistema', 'Pronto', 'Cole a chave OpenRouter, ajuste o prompt e clique em gerar.'),
+  ])
+
+  const abortRef = useRef<AbortController | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
+
+  const cleanInputs = useMemo(() => splitInputs(inputs), [inputs])
+  const isBusy = status === 'generating' || status === 'correcting'
+  const canReview = status === 'reviewing' && activeRun !== null
+  const finalDiffParts = useMemo(() => diffLines(originalPrompt || seedPrompt, currentPrompt), [currentPrompt, originalPrompt, seedPrompt])
+  const lastDiffParts = useMemo(() => diffLines(lastPatchBefore || currentPrompt, currentPrompt), [currentPrompt, lastPatchBefore])
+
+  function appendLog(agent: AgentName, title: string, body: string) {
+    setLogs((entries) => [makeLog(agent, title, body), ...entries].slice(0, 80))
+  }
+
+  function toggleTheme() {
     setTheme((prev) => {
       const next = prev === 'light' ? 'dark' : 'light'
       localStorage.setItem('prompt-bootcamp-theme', next)
@@ -126,77 +158,8 @@ function App() {
     })
   }
 
-  const togglePanel = (key: string) => {
+  function togglePanel(key: string) {
     setCollapsedPanels((prev) => ({ ...prev, [key]: !prev[key] }))
-  }
-
-  const handleCopyPrompt = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-      appendLog('sistema', 'Prompt copiado', 'O melhor prompt foi copiado para a área de transferência.')
-    } catch (err) {
-      appendLog('sistema', 'Erro ao copiar', 'Não foi possível acessar a área de transferência.')
-    }
-  }
-
-  const apiKeyRef = useRef('')
-  const [apiKeyDraft, setApiKeyDraft] = useState('')
-  const [hasApiKey, setHasApiKey] = useState(false)
-  const [model, setModel] = useState(DEFAULT_MODEL)
-  const [maxParallelRuns, setMaxParallelRuns] = useState(RUNS_PER_PROMPT)
-  const [sessionId, setSessionId] = useState(makeSessionId)
-  const [seedPrompt, setSeedPrompt] = useState('')
-  const [taskInstructions, setTaskInstructions] = useState(starterTask)
-  const [evaluationCriteria, setEvaluationCriteria] = useState(starterCriteria)
-  const [criteriaVersion, setCriteriaVersion] = useState(1)
-  const [inputs, setInputs] = useState([starterInput])
-  const [userInstruction, setUserInstruction] = useState('')
-  const [status, setStatus] = useState<Status>('idle')
-  const [logs, setLogs] = useState<LogEntry[]>([
-    makeLog('sistema', 'Pronto', 'Informe a chave OpenRouter, revise critérios e inputs, depois inicie.'),
-  ])
-  const [currentRuns, setCurrentRuns] = useState<PromptRun[]>([])
-  const [history, setHistory] = useState<PromptResult[]>([])
-  const [originalResult, setOriginalResult] = useState<PromptResult | null>(null)
-  const [bestResult, setBestResult] = useState<PromptResult | null>(null)
-  const [lastCandidate, setLastCandidate] = useState<Candidate | null>(null)
-  const [creatorMessages, setCreatorMessages] = useState<any[]>([])
-  const [diffBefore, setDiffBefore] = useState('')
-  const [errorMessage, setErrorMessage] = useState('')
-  const [runSuggestion, setRunSuggestion] = useState<RunCriterionSuggestion | null>(null)
-  const [suggestionDraft, setSuggestionDraft] = useState('')
-  const [evaluatingRunId, setEvaluatingRunId] = useState('')
-  const abortRef = useRef<AbortController | null>(null)
-  const importInputRef = useRef<HTMLInputElement | null>(null)
-
-  const isRunning = status === 'running'
-  const canSend = status === 'paused' || status === 'stopped' || status === 'done' || (status === 'error' && Boolean(bestResult && originalResult))
-  const sendLabel = status === 'paused' ? 'Continuar' : status === 'error' ? 'Retomar' : 'Enviar'
-
-  const cleanInputs = useMemo(() => inputs.map((input) => input.trim()).filter(Boolean), [inputs])
-  const currentFailedRuns = currentRuns.filter((run) => run.status !== 'completed').length
-
-  function appendLog(agent: LogEntry['agent'], title: string, body: string) {
-    setLogs((entries) => [makeLog(agent, title, body), ...entries].slice(0, 80))
-  }
-
-  function resetResultsForCriteriaChange(nextCriteria: string) {
-    const promptToKeep = bestResult?.prompt || seedPrompt
-    setEvaluationCriteria(nextCriteria)
-    setCriteriaVersion((version) => version + 1)
-    setSeedPrompt(promptToKeep)
-    setCurrentRuns([])
-    setHistory([])
-    setOriginalResult(null)
-    setBestResult(null)
-    setLastCandidate(null)
-    setDiffBefore('')
-    setCreatorMessages([])
-    setStatus('idle')
-    setErrorMessage('')
-    appendLog('criterios', 'Critérios atualizados', 'As notas anteriores foram arquivadas implicitamente; reinicie a avaliação do zero.')
   }
 
   function loadApiKey() {
@@ -221,25 +184,233 @@ function App() {
     appendLog('sistema', 'Chave removida', 'A chave em memória foi apagada.')
   }
 
+  function buildConfig(prompt = currentPrompt): PromptTrainingConfig {
+    if (!apiKeyRef.current.trim()) {
+      throw new Error('Informe a chave da OpenRouter antes de gerar.')
+    }
+
+    if (!model.trim()) {
+      throw new Error('Informe o modelo que será usado nas chamadas.')
+    }
+
+    if (!prompt.trim()) {
+      throw new Error('Insira o prompt que será treinado.')
+    }
+
+    if (!taskInstructions.trim()) {
+      throw new Error('Descreva a tarefa do prompt.')
+    }
+
+    if (mode === 'com-input' && cleanInputs.length === 0) {
+      throw new Error('Inclua pelo menos um input de teste ou mude para treino sem input.')
+    }
+
+    return {
+      apiKey: apiKeyRef.current.trim(),
+      model: model.trim(),
+      sessionId,
+      prompt: prompt.trim(),
+      taskInstructions: taskInstructions.trim(),
+    }
+  }
+
+  function chooseInput(previousRun?: TrainingRun | null) {
+    if (mode === 'sem-input') {
+      return { input: undefined, inputIndex: undefined }
+    }
+
+    if (inputSelectionMode === 'mesmo' && previousRun?.input && previousRun.inputIndex !== undefined) {
+      return { input: previousRun.input, inputIndex: previousRun.inputIndex }
+    }
+
+    const index = randomInputIndex(cleanInputs)
+    return { input: cleanInputs[index], inputIndex: index }
+  }
+
+  async function createRun(prompt: string, turn: number, previousRun?: TrainingRun | null) {
+    const { input, inputIndex } = chooseInput(previousRun)
+    const output = await generatePromptOutput(buildConfig(prompt), input, abortRef.current?.signal)
+
+    return {
+      id: makeRunId(),
+      turn,
+      prompt,
+      input,
+      inputIndex,
+      output,
+    }
+  }
+
+  async function startTraining() {
+    try {
+      const prompt = seedPrompt.trim()
+      buildConfig(prompt)
+
+      const controller = new AbortController()
+      abortRef.current = controller
+      setStatus('generating')
+      setErrorMessage('')
+      setHistory([])
+      setEditedOutput('')
+      setComment('')
+      setLastDiff('')
+      setLastPatchBefore('')
+      setLastRationale('')
+      setOriginalPrompt(prompt)
+      setCurrentPrompt(prompt)
+      appendLog('gerador', 'Geração iniciada', mode === 'com-input' ? 'Gerando output com um input de teste.' : 'Gerando output sem input externo.')
+
+      const run = await createRun(prompt, 1)
+      setActiveRun(run)
+      setStatus('reviewing')
+      appendLog('gerador', 'Output pronto', 'Revise o output, reescreva ou descreva o que precisa mudar.')
+    } catch (error) {
+      handleRuntimeError(error)
+    }
+  }
+
+  async function submitCorrection() {
+    if (!activeRun) return
+
+    const normalizedEditedOutput = editedOutput.trim()
+    const normalizedComment = comment.trim()
+
+    if (!normalizedEditedOutput && !normalizedComment) {
+      setErrorMessage('Reescreva o output ou escreva um comentário antes de corrigir.')
+      return
+    }
+
+    try {
+      const controller = new AbortController()
+      abortRef.current = controller
+      setStatus('correcting')
+      setErrorMessage('')
+      appendLog('otimizador', `Corrigindo turno ${activeRun.turn}`, 'Aplicando o feedback humano no prompt.')
+
+      const revision = await revisePromptFromFeedback(
+        buildConfig(currentPrompt),
+        {
+          output: activeRun.output,
+          input: activeRun.input,
+          editedOutput: normalizedEditedOutput || undefined,
+          comment: normalizedComment || undefined,
+        },
+        history,
+        controller.signal,
+      )
+
+      const finishedTurn: TrainingTurnHistory = {
+        ...activeRun,
+        editedOutput: normalizedEditedOutput || undefined,
+        comment: normalizedComment || undefined,
+        revisedPrompt: revision.prompt,
+        rationale: revision.rationale,
+        diff: revision.diff,
+      }
+      const nextHistory = [...history, finishedTurn]
+
+      setHistory(nextHistory)
+      setCurrentPrompt(revision.prompt)
+      setSeedPrompt(revision.prompt)
+      setLastDiff(revision.diff)
+      setLastPatchBefore(currentPrompt)
+      setLastRationale(revision.rationale)
+      appendLog('otimizador', 'Prompt atualizado', revision.rationale)
+
+      const nextRun = await createRun(revision.prompt, activeRun.turn + 1, activeRun)
+      setActiveRun(nextRun)
+      setEditedOutput('')
+      setComment('')
+      setStatus('reviewing')
+      appendLog('gerador', `Turno ${nextRun.turn} gerado`, nextRun.input ? 'Novo output pronto com input de teste.' : 'Novo output pronto sem input externo.')
+    } catch (error) {
+      handleRuntimeError(error)
+    }
+  }
+
+  function finishTraining() {
+    if (!originalPrompt) {
+      setOriginalPrompt(seedPrompt)
+    }
+
+    setStatus('done')
+    setErrorMessage('')
+    appendLog('sistema', 'Treino finalizado', 'O prompt final está disponível em diff e pode ser copiado.')
+  }
+
+  function stop() {
+    abortRef.current?.abort()
+    setStatus('stopped')
+    appendLog('sistema', 'Execução interrompida', 'A chamada em andamento foi interrompida.')
+  }
+
+  function resetTraining() {
+    abortRef.current?.abort()
+    setActiveRun(null)
+    setHistory([])
+    setEditedOutput('')
+    setComment('')
+    setOriginalPrompt('')
+    setCurrentPrompt(seedPrompt)
+    setLastDiff('')
+    setLastPatchBefore('')
+    setLastRationale('')
+    setStatus('idle')
+    setErrorMessage('')
+    appendLog('sistema', 'Sessão reiniciada', 'O histórico do treino foi limpo.')
+  }
+
+  function handleRuntimeError(error: unknown) {
+    if (isAbortLikeError(error)) {
+      setStatus('stopped')
+      setErrorMessage('')
+      return
+    }
+
+    const message = error instanceof Error ? error.message : 'Falha desconhecida.'
+    setStatus('error')
+    setErrorMessage(message)
+    appendLog('sistema', 'Erro', message)
+  }
+
+  function updateInput(index: number, value: string) {
+    setInputs((items) => items.map((item, itemIndex) => (itemIndex === index ? value : item)))
+  }
+
+  function addInput() {
+    setInputs((items) => [...items, ''])
+  }
+
+  function removeInput(index: number) {
+    setInputs((items) => (items.length > 1 ? items.filter((_, itemIndex) => itemIndex !== index) : ['']))
+  }
+
+  async function handleCopyPrompt(text: string) {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+      appendLog('sistema', 'Prompt copiado', 'O prompt atual foi copiado para a área de transferência.')
+    } catch {
+      setErrorMessage('Não foi possível acessar a área de transferência.')
+    }
+  }
+
   function exportProgress() {
     const payload: ProgressExport = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       exportedAt: new Date().toISOString(),
       model,
-      maxParallelRuns,
       sessionId,
+      mode,
+      inputSelectionMode,
       seedPrompt,
+      currentPrompt,
+      originalPrompt,
       taskInstructions,
-      evaluationCriteria,
-      criteriaVersion,
       inputs,
-      userInstruction,
-      currentRuns,
+      activeRun,
       history,
-      originalResult,
-      bestResult,
-      lastCandidate,
-      diffBefore,
       logs,
     }
 
@@ -259,39 +430,41 @@ function App() {
     if (!file) return
 
     try {
-      const parsed = JSON.parse(await file.text()) as Partial<ProgressExport>
+      const parsed = JSON.parse(await file.text()) as Partial<ProgressExport> & LegacyProgressExport & {
+        seedPrompt?: string
+        currentPrompt?: string
+      }
 
-      if (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3) {
-        throw new Error('Arquivo de progresso incompatível. Esperado schemaVersion 2 ou 3.')
+      if (parsed.schemaVersion === 2 || parsed.schemaVersion === 3) {
+        importLegacyProgress(parsed)
+        return
+      }
+
+      if (parsed.schemaVersion !== 4) {
+        throw new Error('Arquivo de progresso incompatível. Esperado schemaVersion 2, 3 ou 4.')
       }
 
       setModel(parsed.model || DEFAULT_MODEL)
-      setMaxParallelRuns(clampParallelRuns(parsed.maxParallelRuns))
       setSessionId(parsed.sessionId || makeSessionId())
-      setSeedPrompt(parsed.seedPrompt || '')
+      setMode(parsed.mode || 'sem-input')
+      setInputSelectionMode(parsed.inputSelectionMode || 'aleatorio')
+      setSeedPrompt(parsed.currentPrompt || parsed.seedPrompt || starterPrompt)
+      setCurrentPrompt(parsed.currentPrompt || parsed.seedPrompt || starterPrompt)
+      setOriginalPrompt(parsed.originalPrompt || parsed.seedPrompt || '')
       setTaskInstructions(parsed.taskInstructions || starterTask)
-      setEvaluationCriteria(parsed.evaluationCriteria || starterCriteria)
-      setCriteriaVersion(Number(parsed.criteriaVersion) || 1)
       setInputs(Array.isArray(parsed.inputs) && parsed.inputs.length ? parsed.inputs : [starterInput])
-      setUserInstruction(parsed.userInstruction || '')
-      setCurrentRuns(Array.isArray(parsed.currentRuns) ? parsed.currentRuns : [])
+      setActiveRun(parsed.activeRun ?? null)
       setHistory(Array.isArray(parsed.history) ? parsed.history : [])
-      setOriginalResult(parsed.originalResult ?? null)
-      setBestResult(parsed.bestResult ?? null)
-      setLastCandidate(parsed.lastCandidate ?? null)
-      setDiffBefore(parsed.diffBefore || '')
       setLogs(Array.isArray(parsed.logs) ? [makeLog('sistema', 'Progresso importado', 'Sessão carregada de JSON; carregue a chave para continuar.'), ...parsed.logs].slice(0, 80) : [
         makeLog('sistema', 'Progresso importado', 'Sessão carregada de JSON; carregue a chave para continuar.'),
       ])
-      setRunSuggestion(null)
-      setSuggestionDraft('')
-      setStatus('stopped')
+      setStatus(parsed.activeRun ? 'reviewing' : 'idle')
+      setEditedOutput('')
+      setComment('')
+      setLastPatchBefore('')
       setErrorMessage('')
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Falha ao importar progresso.'
-      setStatus('error')
-      setErrorMessage(message)
-      appendLog('sistema', 'Importação falhou', message)
+      handleRuntimeError(error)
     } finally {
       if (importInputRef.current) {
         importInputRef.current.value = ''
@@ -299,373 +472,99 @@ function App() {
     }
   }
 
-  async function evaluateRun(run: PromptRun) {
-    try {
-      const config = buildConfig()
-      const controller = new AbortController()
-      abortRef.current = controller
-      setEvaluatingRunId(run.id)
-      setErrorMessage('')
-      appendLog('criterios', 'Avaliando run', `Buscando lacunas nos critérios a partir do input ${run.inputIndex + 1}.`)
+  function importLegacyProgress(parsed: LegacyProgressExport) {
+    const legacyPrompt =
+      parsed.bestResult?.prompt?.trim() ||
+      parsed.lastCandidate?.prompt?.trim() ||
+      parsed.seedPrompt?.trim() ||
+      starterPrompt
+    const hasLegacyInputs = Array.isArray(parsed.inputs) && parsed.inputs.some((input) => input.trim())
+    const legacyInputs = hasLegacyInputs ? parsed.inputs ?? [] : [starterInput]
 
-      const suggestion = await evaluateRunForCriteria(config, run, controller.signal)
-      setRunSuggestion(suggestion)
-      setSuggestionDraft(suggestion.proposedCriterion)
-      appendLog('criterios', 'Sugestão criada', suggestion.title)
-    } catch (error) {
-      handleRuntimeError(error)
-    } finally {
-      setEvaluatingRunId('')
-    }
+    setModel(parsed.model || DEFAULT_MODEL)
+    setSessionId(parsed.sessionId || makeSessionId())
+    setMode(hasLegacyInputs ? 'com-input' : 'sem-input')
+    setInputSelectionMode('aleatorio')
+    setSeedPrompt(legacyPrompt)
+    setCurrentPrompt(legacyPrompt)
+    setOriginalPrompt(legacyPrompt)
+    setTaskInstructions(parsed.taskInstructions || starterTask)
+    setInputs(legacyInputs)
+    setActiveRun(null)
+    setHistory([])
+    setEditedOutput('')
+    setComment('')
+    setLastDiff('')
+    setLastPatchBefore('')
+    setLastRationale('')
+    setLogs(Array.isArray(parsed.logs) ? [
+      makeLog('sistema', 'JSON legado importado', 'Prompt e inputs foram migrados para o fluxo novo; notas, critérios e runs antigos foram ignorados.'),
+      ...parsed.logs,
+    ].slice(0, 80) : [
+      makeLog('sistema', 'JSON legado importado', 'Prompt e inputs foram migrados para o fluxo novo; carregue a chave para continuar.'),
+    ])
+    setStatus('idle')
+    setErrorMessage('')
   }
-
-  function acceptSuggestion() {
-    if (!runSuggestion) return
-
-    const criterion = suggestionDraft.trim()
-    if (!criterion) {
-      setErrorMessage('A sugestão aceita precisa conter um critério.')
-      return
-    }
-
-    const nextCriteria = `${evaluationCriteria.trim()}\n${criterion.startsWith('-') ? criterion : `- ${criterion}`}`
-    resetResultsForCriteriaChange(nextCriteria)
-    setRunSuggestion(null)
-    setSuggestionDraft('')
-  }
-
-  function rejectSuggestion() {
-    setRunSuggestion(null)
-    setSuggestionDraft('')
-    appendLog('criterios', 'Sugestão rejeitada', 'Os critérios atuais foram preservados.')
-  }
-
-  function buildConfig(): BootcampConfig {
-    if (!apiKeyRef.current.trim()) {
-      throw new Error('Informe a chave da OpenRouter antes de iniciar.')
-    }
-
-    if (!model.trim()) {
-      throw new Error('Informe o modelo que será usado nas chamadas.')
-    }
-
-    if (!taskInstructions.trim()) {
-      throw new Error('Descreva a tarefa que o prompt deve executar.')
-    }
-
-    if (!evaluationCriteria.trim()) {
-      throw new Error('Defina os critérios de avaliação.')
-    }
-
-    if (cleanInputs.length === 0) {
-      throw new Error('Inclua pelo menos um input de teste.')
-    }
-
-    return {
-      apiKey: apiKeyRef.current.trim(),
-      model: model.trim(),
-      maxParallelRuns,
-      sessionId,
-      seedPrompt: seedPrompt.trim(),
-      taskInstructions: taskInstructions.trim(),
-      evaluationCriteria: evaluationCriteria.trim(),
-      inputs: cleanInputs,
-      userInstruction: userInstruction.trim(),
-    }
-  }
-
-  async function start() {
-    try {
-      const config = buildConfig()
-      const controller = new AbortController()
-      abortRef.current = controller
-      setStatus('running')
-      setErrorMessage('')
-      setCurrentRuns([])
-      setHistory([])
-      setOriginalResult(null)
-      setBestResult(null)
-      setLastCandidate(null)
-      setCreatorMessages([])
-      setDiffBefore('')
-      appendLog(
-        'sistema',
-        'Sessão iniciada',
-        `${RUNS_PER_PROMPT} avaliações serão usadas por prompt, com até ${config.maxParallelRuns} execuções simultâneas.`,
-      )
-
-      const initialPrompt =
-        config.seedPrompt ||
-        (await createInitialPrompt(config, controller.signal).then((prompt) => {
-          appendLog('criador', 'Prompt inicial criado', 'O campo de prompt estava vazio; o CRIADOR gerou um system prompt do zero.')
-          return prompt
-        }))
-
-      appendLog('executor', 'Baseline em execução', 'Rodando o prompt inicial contra os inputs de teste.')
-      const baseline = await runPromptEvaluation(
-        config,
-        initialPrompt,
-        'Baseline',
-        (run, index) => setCurrentRuns((runs) => updateRunSlot(runs, run, index)),
-        controller.signal,
-      )
-
-      setOriginalResult(baseline)
-      setBestResult(baseline)
-      setHistory([baseline])
-      appendLog('avaliador', 'Baseline avaliado', `Nota média ${baseline.averageScore}/10. Pior run: ${baseline.minScore}/10.`)
-
-      await searchForImprovement(config, baseline, baseline, '', controller)
-    } catch (error) {
-      handleRuntimeError(error)
-    }
-  }
-
-  async function continueSession() {
-    if (!bestResult || !originalResult) {
-      appendLog('sistema', 'Nada para continuar', 'Inicie uma sessão antes de enviar instruções.')
-      return
-    }
-
-    const instruction = userInstruction.trim()
-
-    if (/^parar$/i.test(instruction)) {
-      stop(false)
-      setStatus('stopped')
-      appendLog('usuario', 'Sessão parada', 'O usuário solicitou parada manual.')
-      return
-    }
-
-    try {
-      const config = buildConfig()
-      const controller = new AbortController()
-      abortRef.current = controller
-      setStatus('running')
-      setErrorMessage('')
-      setCurrentRuns([])
-      appendLog('usuario', 'Instrução enviada', instruction || 'Continuar sem instrução adicional.')
-
-      await searchForImprovement(config, bestResult, originalResult, instruction, controller)
-    } catch (error) {
-      handleRuntimeError(error)
-    }
-  }
-
-  async function searchForImprovement(
-    config: BootcampConfig,
-    currentBest: PromptResult,
-    original: PromptResult,
-    instruction: string,
-    controller: AbortController,
-  ) {
-    let activeBest = currentBest
-    let inferiorTurns = 0
-    let localMessages = [...creatorMessages]
-
-    let lastEvaluationResult: PromptResult | null = null
-    let wasAccepted = false
-
-    while (inferiorTurns < 3) {
-      const turnNum = history.length + inferiorTurns + 1
-      appendLog('criador', `Turno ${turnNum}`, 'Gerando patch incremental com otimização.')
-      let candidate: Candidate
-
-      try {
-        const response = await createCandidatePrompt(
-          config,
-          activeBest,
-          original,
-          instruction,
-          localMessages,
-          lastEvaluationResult,
-          wasAccepted,
-          controller.signal,
-        )
-
-        candidate = response.candidate
-        localMessages = response.updatedHistory
-        setCreatorMessages(localMessages)
-      } catch (error) {
-        if (isAbortLikeError(error)) {
-          throw error
-        }
-
-        inferiorTurns += 1
-        appendLog(
-          'criador',
-          'Candidato inválido',
-          `${error instanceof Error ? error.message : 'O CRIADOR não retornou candidato aproveitável.'} Tentativa descartada ${inferiorTurns}/3.`,
-        )
-        lastEvaluationResult = null
-        wasAccepted = false
-        continue
-      }
-
-      setLastCandidate(candidate)
-      setDiffBefore(activeBest.prompt)
-      setCurrentRuns([])
-      appendLog('criador', 'Patch pronto', candidate.rationale)
-
-      const result = await runPromptEvaluation(
-        config,
-        candidate.prompt,
-        `Candidato ${turnNum}`,
-        (run, index) => setCurrentRuns((runs) => updateRunSlot(runs, run, index)),
-        controller.signal,
-      )
-
-      setHistory((items) => [result, ...items])
-      lastEvaluationResult = result
-
-      if (result.averageScore > activeBest.averageScore) {
-        wasAccepted = true
-        activeBest = result
-        setBestResult(result)
-        setSeedPrompt(result.prompt)
-        setCurrentRuns(result.runs)
-        setStatus('paused')
-        appendLog(
-          'avaliador',
-          'Melhora aplicada',
-          `Novo melhor prompt: ${result.averageScore}/10 contra ${diffBefore ? 'anterior' : 'original'}. O prompt foi atualizado e a sessão pausou para revisão.`,
-        )
-        return
-      }
-
-      wasAccepted = false
-      inferiorTurns += 1
-      appendLog(
-        'avaliador',
-        'Candidato descartado',
-        `Nota ${result.averageScore}/10 não superou ${activeBest.averageScore}/10. Piora consecutiva ${inferiorTurns}/3.`,
-      )
-    }
-
-    setStatus('done')
-    appendLog('sistema', 'Sem melhora suficiente', 'Três tentativas consecutivas não responderam com melhora ao prompt atual.')
-  }
-
-  function handleRuntimeError(error: unknown) {
-    if (isAbortLikeError(error)) {
-      setStatus('stopped')
-      appendLog('sistema', 'Execução interrompida', 'As chamadas em andamento foram canceladas.')
-      return
-    }
-
-    const message = error instanceof Error ? error.message : 'Erro desconhecido.'
-    setStatus('error')
-    setErrorMessage(message)
-    appendLog('sistema', 'Erro', message)
-  }
-
-  function stop(markStatus = true) {
-    abortRef.current?.abort()
-    abortRef.current = null
-    if (markStatus) {
-      setStatus('stopped')
-      appendLog('sistema', 'Parada solicitada', 'A execução será interrompida assim que a chamada atual responder ao cancelamento.')
-    }
-  }
-
-  function updateInput(index: number, value: string) {
-    setInputs((items) => items.map((item, itemIndex) => (itemIndex === index ? value : item)))
-  }
-
-  function addInput() {
-    setInputs((items) => [...items, ''])
-  }
-
-  function removeInput(index: number) {
-    setInputs((items) => (items.length === 1 ? [''] : items.filter((_, itemIndex) => itemIndex !== index)))
-  }
-
-  const diffParts = useMemo(() => {
-    if (!bestResult || !diffBefore) return []
-    return diffLines(diffBefore, bestResult.prompt)
-  }, [bestResult, diffBefore])
 
   return (
     <main className={`app-shell theme-${theme}`}>
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark">PB</span>
+          <div className="brand-mark">PB</div>
           <div>
             <h1>Prompt Bootcamp</h1>
-            <p>Otimização adversarial local com OpenRouter</p>
+            <p>Treino direto por output, correção humana e patch no prompt.</p>
           </div>
         </div>
-        <div className="header-actions" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button
-            type="button"
-            className="icon-button theme-toggle"
-            onClick={toggleTheme}
-            title={theme === 'light' ? 'Mudar para Dark Mode' : 'Mudar para Light Mode'}
-            aria-label="Alternar tema"
-          >
+        <div className="header-actions">
+          <span className={`status-pill status-${status}`}>
+            {isBusy ? <Loader2 className="spin" size={14} /> : null}
+            {statusLabel(status)}
+          </span>
+          <button type="button" className="icon-button theme-toggle" onClick={toggleTheme} aria-label="Alternar tema">
             {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
           </button>
-          <div className={`status-pill status-${status}`}>
-            {isRunning ? <Loader2 size={15} className="spin" /> : <Activity size={15} />}
-            <span>{statusLabel(status)}</span>
-          </div>
         </div>
       </header>
 
       <section className="workspace">
-        <aside className="control-panel" aria-label="Configuração da sessão">
-          <Panel
-            title="Chave e modelo"
-            icon={<KeyRound size={17} />}
-            collapsed={collapsedPanels.config}
-            onToggle={() => togglePanel('config')}
-          >
+        <aside className="control-panel">
+          <Panel title="Configuração" icon={<KeyRound size={17} />} collapsed={collapsedPanels.config} onToggle={() => togglePanel('config')}>
             <label>
-              <span>OpenRouter API key</span>
+              <span>Chave OpenRouter</span>
               <input
                 type="password"
                 value={apiKeyDraft}
                 onChange={(event) => setApiKeyDraft(event.target.value)}
-                placeholder="sk-or-..."
-                autoComplete="off"
+                placeholder="Cole a chave aqui"
+                disabled={isBusy}
               />
             </label>
             <div className="key-row">
               <span className={hasApiKey ? 'key-loaded' : 'key-empty'}>
                 {hasApiKey ? 'Chave ativa em memória' : 'Nenhuma chave carregada'}
               </span>
-              <div className="key-actions" style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                <button type="button" className="secondary-button compact" onClick={loadApiKey} disabled={!apiKeyDraft.trim()}>
+              <div className="key-actions">
+                <button type="button" className="secondary-button compact" onClick={loadApiKey} disabled={!apiKeyDraft.trim() || isBusy}>
                   <KeyRound size={14} />
                   Usar chave
                 </button>
-                <button type="button" className="icon-button" onClick={clearApiKey} disabled={!hasApiKey} aria-label="Limpar chave" style={{ width: '30px', height: '30px' }}>
+                <button type="button" className="icon-button" onClick={clearApiKey} disabled={!hasApiKey || isBusy} aria-label="Limpar chave">
                   <X size={15} />
                 </button>
               </div>
             </div>
             <label>
-              <span>Modelo padrão</span>
-              <input value={model} onChange={(event) => setModel(event.target.value)} />
+              <span>Modelo</span>
+              <input value={model} onChange={(event) => setModel(event.target.value)} disabled={isBusy} />
             </label>
-            <label>
-              <span>Execuções paralelas</span>
-              <input
-                type="number"
-                min={1}
-                max={RUNS_PER_PROMPT}
-                value={maxParallelRuns}
-                onChange={(event) => setMaxParallelRuns(clampParallelRuns(event.target.value))}
-              />
-            </label>
-            <p className="hint-text">
-              Até {RUNS_PER_PROMPT} runs simultâneos. Reduza se houver rate limit ou instabilidade do provedor.
-            </p>
             <div className="action-row utility-actions">
               <button type="button" className="secondary-button" onClick={exportProgress}>
                 <Download size={15} />
                 Exportar
               </button>
-              <button type="button" className="secondary-button" onClick={() => importInputRef.current?.click()} disabled={isRunning}>
+              <button type="button" className="secondary-button" onClick={() => importInputRef.current?.click()} disabled={isBusy}>
                 <Upload size={15} />
                 Importar
               </button>
@@ -679,223 +578,197 @@ function App() {
             </div>
           </Panel>
 
-          <Panel
-            title="Prompt e tarefa"
-            icon={<Bot size={17} />}
-            collapsed={collapsedPanels.prompt}
-            onToggle={() => togglePanel('prompt')}
-          >
+          <Panel title="Prompt" icon={<Bot size={17} />} collapsed={collapsedPanels.prompt} onToggle={() => togglePanel('prompt')}>
+            <div className="mode-toggle" role="group" aria-label="Modo de treino">
+              <button type="button" className={mode === 'sem-input' ? 'active' : ''} onClick={() => setMode('sem-input')} disabled={isBusy}>
+                Sem input
+              </button>
+              <button type="button" className={mode === 'com-input' ? 'active' : ''} onClick={() => setMode('com-input')} disabled={isBusy}>
+                Com input
+              </button>
+            </div>
             <label>
-              <span>Prompt para melhoria</span>
+              <span>Prompt para treinar</span>
               <textarea
                 value={seedPrompt}
-                onChange={(event) => setSeedPrompt(event.target.value)}
-                placeholder="Opcional. Se ficar vazio, o CRIADOR gera um prompt do zero."
-                rows={7}
+                onChange={(event) => {
+                  setSeedPrompt(event.target.value)
+                  if (!activeRun && status !== 'done') {
+                    setCurrentPrompt(event.target.value)
+                  }
+                }}
+                rows={8}
+                disabled={isBusy}
               />
             </label>
             <label>
-              <span>Instruções da tarefa</span>
-              <textarea value={taskInstructions} onChange={(event) => setTaskInstructions(event.target.value)} rows={5} />
+              <span>Descrição da tarefa</span>
+              <textarea value={taskInstructions} onChange={(event) => setTaskInstructions(event.target.value)} rows={4} disabled={isBusy} />
             </label>
           </Panel>
 
-          <Panel
-            title="Critérios e inputs"
-            icon={<ClipboardList size={17} />}
-            collapsed={collapsedPanels.criteria}
-            onToggle={() => togglePanel('criteria')}
-          >
-            <label>
-              <span>Critérios de avaliação · v{criteriaVersion}</span>
-              <textarea
-                value={evaluationCriteria}
-                onChange={(event) => setEvaluationCriteria(event.target.value)}
-                rows={8}
-              />
-            </label>
-            <div className="input-list">
-              <div className="row-title">
-                <span>Inputs de teste</span>
-                <button type="button" className="icon-button" onClick={addInput} aria-label="Adicionar input">
-                  <Plus size={16} />
-                </button>
-              </div>
-              {inputs.map((input, index) => (
-                <div className="input-item" key={`input-${index}`}>
-                  <textarea
-                     value={input}
-                     onChange={(event) => updateInput(index, event.target.value)}
-                     rows={4}
-                     placeholder={`Input ${index + 1}`}
-                  />
-                  <button type="button" className="icon-button danger" onClick={() => removeInput(index)} aria-label="Remover input">
-                    <Trash2 size={15} />
+          {mode === 'com-input' ? (
+            <Panel title="Inputs de teste" icon={<Send size={17} />} collapsed={collapsedPanels.inputs} onToggle={() => togglePanel('inputs')}>
+              <div className="input-list">
+                <div className="row-title">
+                  <span>Lista de inputs</span>
+                  <button type="button" className="icon-button" onClick={addInput} aria-label="Adicionar input" disabled={isBusy}>
+                    <Plus size={16} />
                   </button>
                 </div>
-              ))}
-            </div>
-          </Panel>
+                {inputs.map((input, index) => (
+                  <div className="input-item" key={`input-${index}`}>
+                    <textarea
+                      value={input}
+                      onChange={(event) => updateInput(index, event.target.value)}
+                      rows={4}
+                      placeholder={`Input ${index + 1}`}
+                      disabled={isBusy}
+                    />
+                    <button type="button" className="icon-button danger" onClick={() => removeInput(index)} aria-label="Remover input" disabled={isBusy}>
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="mode-toggle compact-toggle" role="group" aria-label="Seleção de input">
+                <button type="button" className={inputSelectionMode === 'aleatorio' ? 'active' : ''} onClick={() => setInputSelectionMode('aleatorio')} disabled={isBusy}>
+                  Aleatório
+                </button>
+                <button type="button" className={inputSelectionMode === 'mesmo' ? 'active' : ''} onClick={() => setInputSelectionMode('mesmo')} disabled={isBusy || !activeRun?.input}>
+                  Mesmo input
+                </button>
+              </div>
+            </Panel>
+          ) : null}
 
-          <Panel
-            title="Controle humano"
-            icon={<Send size={17} />}
-            collapsed={collapsedPanels.control}
-            onToggle={() => togglePanel('control')}
-          >
-            <textarea
-              value={userInstruction}
-              onChange={(event) => setUserInstruction(event.target.value)}
-              placeholder="Quando pausar: continuar, parar ou escreva uma instrução adicional."
-              rows={4}
-            />
-            <div className="action-row">
-              <button type="button" className="primary-button" onClick={start} disabled={isRunning}>
+          <Panel title="Controle" icon={<Play size={17} />} collapsed={collapsedPanels.feedback} onToggle={() => togglePanel('feedback')}>
+            <div className="action-row control-actions">
+              <button type="button" className="primary-button" onClick={startTraining} disabled={isBusy}>
                 <Play size={16} />
-                Iniciar
+                Gerar
               </button>
-              <button type="button" className="secondary-button" onClick={() => stop()} disabled={!isRunning}>
+              <button type="button" className="secondary-button" onClick={stop} disabled={!isBusy}>
                 <Square size={15} />
                 Parar
               </button>
-              <button type="button" className="secondary-button" onClick={continueSession} disabled={!canSend || isRunning}>
-                <Send size={15} />
-                {sendLabel}
+              <button type="button" className="secondary-button" onClick={resetTraining} disabled={isBusy}>
+                <RotateCw size={15} />
+                Reiniciar
               </button>
             </div>
             {errorMessage ? <p className="error-text">{errorMessage}</p> : null}
           </Panel>
         </aside>
 
-        <section className="board" aria-label="Painel de agentes">
-          <div className="score-strip">
-            <MetricCard label="Prompt original" value={originalResult ? `${originalResult.averageScore}/10` : 'sem nota'} score={originalResult?.averageScore} />
-            <MetricCard label="Melhor prompt" value={bestResult ? `${bestResult.averageScore}/10` : 'sem nota'} score={bestResult?.averageScore} />
-            <MetricCard label="Runs do turno" value={`${currentRuns.length}/${RUNS_PER_PROMPT}`} />
-            <MetricCard label="Falhas operacionais" value={String(currentFailedRuns)} />
+        <section className="board" aria-label="Treino do prompt">
+          <div className="metric-strip">
+            <MetricCard label="Modo" value={mode === 'sem-input' ? 'Sem input' : 'Com input'} />
+            <MetricCard label="Turno" value={activeRun ? String(activeRun.turn) : '0'} />
+            <MetricCard label="Correções" value={String(history.length)} />
+            <MetricCard label="Inputs" value={mode === 'com-input' ? String(cleanInputs.length) : 'nenhum'} />
           </div>
 
-          <div className="agent-grid">
-            <AgentPanel title="CRIADOR" icon={<Bot size={18} />} tone="creator">
-              {lastCandidate ? (
-                <>
-                  <p className="muted">{lastCandidate.rationale}</p>
-                  <pre className="code-block">{lastCandidate.diff}</pre>
-                </>
+          <div className="training-grid">
+            <AgentPanel title="Output atual" icon={<Bot size={18} />} tone="generator">
+              {activeRun ? (
+                <div className="run-list">
+                  {activeRun.input ? (
+                    <article className="run-card subtle-card">
+                      <div className="run-head">
+                        <strong>Input usado</strong>
+                        <span>{activeRun.inputIndex !== undefined ? `#${activeRun.inputIndex + 1}` : 'manual'}</span>
+                      </div>
+                      <p>{activeRun.input}</p>
+                    </article>
+                  ) : null}
+                  <article className="run-card">
+                    <div className="run-head">
+                      <strong>Turno {activeRun.turn}</strong>
+                      <span>{mode === 'sem-input' ? 'sem input externo' : 'com input'}</span>
+                    </div>
+                    <p>{activeRun.output}</p>
+                  </article>
+                </div>
               ) : (
-                <Empty text="Aguardando geração de candidato." />
+                <Empty text="Clique em gerar para criar o primeiro output." />
               )}
             </AgentPanel>
 
-            <AgentPanel title="EXECUÇÕES" icon={<RotateCw size={18} />} tone="runner">
-              {currentRuns.length ? (
-                <div className="run-list">
-                  {currentRuns.map((run, index) => (
-                    <article className="run-card" key={run.id}>
+            <AgentPanel title="Correção humana" icon={<Send size={18} />} tone="feedback">
+              {canReview ? (
+                <div className="feedback-form">
+                  <label>
+                    <span>Output reescrito</span>
+                    <textarea value={editedOutput} onChange={(event) => setEditedOutput(event.target.value)} rows={9} placeholder="Cole aqui como o output deveria ficar." />
+                  </label>
+                  <label>
+                    <span>Comentário de correção</span>
+                    <textarea value={comment} onChange={(event) => setComment(event.target.value)} rows={5} placeholder="Ou descreva a regra que o prompt deve aprender." />
+                  </label>
+                  <div className="action-row">
+                    <button type="button" className="primary-button" onClick={submitCorrection}>
+                      <Send size={16} />
+                      Corrigir
+                    </button>
+                    <button type="button" className="secondary-button" onClick={finishTraining}>
+                      <Check size={15} />
+                      OK
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <Empty text={isBusy ? 'Aguarde a chamada em andamento.' : 'A correção aparece quando houver um output para revisar.'} />
+              )}
+            </AgentPanel>
+
+            <AgentPanel title="Prompt atual" icon={<Diff size={18} />} tone="prompt">
+              <div className="prompt-meta">
+                <span>{currentPrompt.length} caracteres</span>
+                <button type="button" className="secondary-button compact" onClick={() => void handleCopyPrompt(currentPrompt)}>
+                  {copied ? <Check size={13} /> : <Copy size={13} />}
+                  {copied ? 'Copiado' : 'Copiar'}
+                </button>
+              </div>
+              <pre className="prompt-box">{currentPrompt || 'Sem prompt.'}</pre>
+            </AgentPanel>
+
+            <AgentPanel title="Último patch" icon={<RotateCw size={18} />} tone="patch">
+              {lastDiff ? (
+                <>
+                  <p className="muted">{lastRationale}</p>
+                  <div className="diff-grid inline-diff">
+                    {lastDiffParts.map((part, index) => (
+                      <pre className={part.added ? 'diff-added' : part.removed ? 'diff-removed' : 'diff-context'} key={`last-diff-${index}`}>
+                        {part.value}
+                      </pre>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <Empty text="O diff do patch aparece após a primeira correção." />
+              )}
+            </AgentPanel>
+
+            <AgentPanel title="Histórico" icon={<ChevronDown size={18} />} tone="history">
+              {history.length ? (
+                <div className="history-list">
+                  {history.map((item) => (
+                    <article key={item.id}>
                       <div className="run-head">
-                        <strong>Run {run.runNumber ?? index + 1}</strong>
-                        <span className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
-                          {run.status === 'completed' ? `${run.evaluation.score}/10` : runStatusLabel(run.status)}
-                        </span>
+                        <strong>Turno {item.turn}</strong>
+                        <span>{item.input ? 'com input' : 'sem input'}</span>
                       </div>
-                      <p>{run.output || run.error || 'Run sem output disponível.'}</p>
-                      <div className="run-actions">
-                        <button
-                          type="button"
-                          className="secondary-button compact"
-                          onClick={() => void evaluateRun(run)}
-                          disabled={isRunning || Boolean(evaluatingRunId)}
-                        >
-                          {evaluatingRunId === run.id ? <Loader2 size={14} className="spin" /> : <ShieldCheck size={14} />}
-                          Avaliar run
-                        </button>
-                      </div>
+                      <p>{item.rationale}</p>
                     </article>
                   ))}
                 </div>
               ) : (
-                <Empty text="Os outputs aparecem aqui em tempo real." />
+                <Empty text="Sem correções aplicadas ainda." />
               )}
             </AgentPanel>
 
-            <AgentPanel title="AVALIADOR" icon={<ShieldCheck size={18} />} tone="evaluator">
-              {currentRuns.length ? (
-                <div className="evaluation-list">
-                  {currentRuns.map((run, index) => (
-                    <div className="evaluation-row" key={`eval-${run.id}`}>
-                      <span>#{run.runNumber ?? index + 1}</span>
-                      <strong className={run.status === 'completed' ? scoreClass(run.evaluation.score) : 'score-muted'}>
-                        {run.status === 'completed' ? `${run.evaluation.score}/10` : 'falhou'}
-                      </strong>
-                      <p>{run.evaluation.summary}</p>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <Empty text="Cada output será avaliado isoladamente." />
-              )}
-            </AgentPanel>
-
-            <AgentPanel title="MELHOR PROMPT" icon={<ClipboardList size={18} />} tone="best">
-              {bestResult ? (
-                <>
-                  <div className="prompt-meta" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                      <span>Média {bestResult.averageScore}/10</span>
-                      <span>Mín. {bestResult.minScore}/10</span>
-                      <span>Máx. {bestResult.maxScore}/10</span>
-                      <span>Válidos {bestResult.completedRuns}/{RUNS_PER_PROMPT}</span>
-                      <span>Falhas {bestResult.failedRuns}</span>
-                    </div>
-                    <button
-                      type="button"
-                      className="secondary-button compact copy-prompt-btn"
-                      onClick={() => handleCopyPrompt(bestResult.prompt)}
-                      style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', minHeight: '28px', padding: '0 8px' }}
-                    >
-                      {copied ? <Check size={13} style={{ color: 'var(--success)' }} /> : <Copy size={13} />}
-                      <span>{copied ? 'Copiado!' : 'Copiar'}</span>
-                    </button>
-                  </div>
-                  <pre className="prompt-box">{bestResult.prompt}</pre>
-                </>
-              ) : (
-                <Empty text="O melhor prompt será exibido após o baseline." />
-              )}
-            </AgentPanel>
-
-            <AgentPanel title="HISTÓRICO" icon={<Activity size={18} />} tone="history">
-              {history.length ? (
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Turno</th>
-                      <th>Nota</th>
-                      <th>Min/Max</th>
-                      <th>Válidos</th>
-                      <th>Falhas</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {history.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.label}</td>
-                        <td className={scoreClass(item.averageScore)}>{item.averageScore}/10</td>
-                        <td>
-                          {item.minScore}/{item.maxScore}
-                        </td>
-                        <td>{item.completedRuns}/{RUNS_PER_PROMPT}</td>
-                        <td>{item.failedRuns}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <Empty text="Sem turnos avaliados ainda." />
-              )}
-            </AgentPanel>
-
-            <AgentPanel title="LOG" icon={<Diff size={18} />} tone="log">
+            <AgentPanel title="Log" icon={<Diff size={18} />} tone="log">
               <div className="log-list">
                 {logs.map((entry) => (
                   <article key={entry.id}>
@@ -910,89 +783,43 @@ function App() {
         </section>
       </section>
 
-      {runSuggestion ? (
-        <div className="modal-overlay" onClick={rejectSuggestion}>
-          <div className="modal-container suggestion-modal" onClick={(e) => e.stopPropagation()}>
+      {status === 'done' ? (
+        <div className="modal-overlay">
+          <div className="modal-container diff-modal">
             <div className="modal-header">
               <div>
-                <h2>{runSuggestion.title}</h2>
-                <p className="modal-subtitle">
-                  Escopo: <span className="badge">{scopeLabel(runSuggestion.scope)}</span> · Aceitar altera os critérios e reinicia a avaliação do zero.
-                </p>
+                <h2>Prompt final</h2>
+                <p className="modal-subtitle">Compare o prompt inicial com o prompt treinado.</p>
               </div>
-              <button type="button" className="icon-button close-modal" onClick={rejectSuggestion} aria-label="Fechar sugestão">
+              <button type="button" className="icon-button close-modal" onClick={() => setStatus('reviewing')} aria-label="Fechar diff">
                 <X size={16} />
               </button>
             </div>
-            <div className="modal-body suggestion-body">
-              <div className="suggestion-grid">
-                <section className="evidence-section">
-                  <strong>Evidência</strong>
-                  <p>{runSuggestion.evidence}</p>
-                </section>
-                <section className="risk-section">
-                  <strong>Risco</strong>
-                  <p>{runSuggestion.risk}</p>
-                </section>
-                <section className="example-section">
-                  <strong>Exemplo de pontuação</strong>
-                  <p>{runSuggestion.scoringExample}</p>
-                </section>
-              </div>
-              <label className="modal-label">
-                <span>Critério proposto para adição</span>
-                <textarea value={suggestionDraft} onChange={(event) => setSuggestionDraft(event.target.value)} rows={4} />
-              </label>
-              <div className="modal-actions">
-                <button type="button" className="primary-button accept-btn" onClick={acceptSuggestion}>
-                  <Check size={16} />
-                  Aceitar e reiniciar
-                </button>
-                <button type="button" className="secondary-button reject-btn" onClick={rejectSuggestion}>
-                  <X size={15} />
-                  Rejeitar
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {status === 'paused' && bestResult ? (
-        <div className="modal-overlay" onClick={() => stop()}>
-          <div className="modal-container diff-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <div>
-                <h2>Melhora encontrada</h2>
-                <p className="modal-subtitle">Revise as alterações do prompt no diff abaixo. Você pode continuar ou ajustar orientações.</p>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <span className={`score-badge ${scoreClass(bestResult.averageScore)}`}>
-                  {bestResult.averageScore}/10
-                </span>
-                <button type="button" className="icon-button close-modal" onClick={() => stop()} aria-label="Fechar diff">
-                  <X size={16} />
-                </button>
-              </div>
-            </div>
             <div className="modal-body">
+              <div className="side-by-side-diff">
+                <section>
+                  <h3>Inicial</h3>
+                  <pre>{originalPrompt || seedPrompt}</pre>
+                </section>
+                <section>
+                  <h3>Final</h3>
+                  <pre>{currentPrompt}</pre>
+                </section>
+              </div>
               <div className="diff-grid">
-                {diffParts.map((part, index) => (
-                  <pre
-                    className={part.added ? 'diff-added' : part.removed ? 'diff-removed' : 'diff-context'}
-                    key={`diff-${index}`}
-                  >
+                {finalDiffParts.map((part, index) => (
+                  <pre className={part.added ? 'diff-added' : part.removed ? 'diff-removed' : 'diff-context'} key={`final-diff-${index}`}>
                     {part.value}
                   </pre>
                 ))}
               </div>
-              <div className="modal-actions" style={{ marginTop: '16px' }}>
-                <button type="button" className="primary-button" onClick={continueSession}>
-                  <Play size={16} />
-                  Continuar otimização
+              <div className="modal-actions">
+                <button type="button" className="primary-button" onClick={() => void handleCopyPrompt(currentPrompt)}>
+                  {copied ? <Check size={16} /> : <Copy size={16} />}
+                  {copied ? 'Copiado' : 'Copiar prompt final'}
                 </button>
-                <button type="button" className="secondary-button" onClick={() => stop()}>
-                  Fechar visualização
+                <button type="button" className="secondary-button" onClick={() => setStatus('reviewing')}>
+                  Fechar
                 </button>
               </div>
             </div>
@@ -1006,34 +833,14 @@ function App() {
 function statusLabel(status: Status) {
   const labels: Record<Status, string> = {
     idle: 'pronto',
-    running: 'rodando',
-    paused: 'pausado',
+    generating: 'gerando',
+    reviewing: 'revisando',
+    correcting: 'corrigindo',
+    done: 'concluído',
     stopped: 'parado',
     error: 'erro',
-    done: 'concluído',
   }
   return labels[status]
-}
-
-function runStatusLabel(status: PromptRun['status']) {
-  const labels: Record<PromptRun['status'], string> = {
-    completed: 'ok',
-    output_failed: 'output falhou',
-    evaluation_failed: 'avaliador falhou',
-  }
-  return labels[status]
-}
-
-function scopeLabel(scope: RunCriterionSuggestion['scope']) {
-  const labels: Record<RunCriterionSuggestion['scope'], string> = {
-    global: 'global',
-    especialidade: 'especialidade',
-    formato: 'formato',
-    seguranca: 'segurança',
-    concisao: 'concisão',
-    outro: 'outro',
-  }
-  return labels[scope]
 }
 
 function Panel({
@@ -1052,17 +859,13 @@ function Panel({
   return (
     <section className={`panel ${collapsed ? 'collapsed' : ''}`}>
       <header onClick={onToggle} style={{ cursor: onToggle ? 'pointer' : 'default', userSelect: 'none' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="title-row">
           {icon}
           <h2>{title}</h2>
         </div>
-        {onToggle && (
-          <div className="collapse-icon">
-            {collapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-          </div>
-        )}
+        {onToggle ? <div className="collapse-icon">{collapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}</div> : null}
       </header>
-      {!collapsed && <div className="panel-body">{children}</div>}
+      {!collapsed ? <div className="panel-body">{children}</div> : null}
     </section>
   )
 }
@@ -1081,7 +884,7 @@ function AgentPanel({
   return (
     <section className={`agent-panel ${tone}`}>
       <header>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="title-row">
           {icon}
           <h2>{title}</h2>
         </div>
@@ -1091,11 +894,11 @@ function AgentPanel({
   )
 }
 
-function MetricCard({ label, value, score }: { label: string; value: string; score?: number }) {
+function MetricCard({ label, value }: { label: string; value: string }) {
   return (
     <article className="metric-card">
       <span>{label}</span>
-      <strong className={scoreClass(score)}>{value}</strong>
+      <strong>{value}</strong>
     </article>
   )
 }

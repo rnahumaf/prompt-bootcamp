@@ -64,6 +64,9 @@ app.post('/api/openrouter/chat', async (request, response) => {
         temperature,
         max_tokens: maxTokens,
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+        provider: {
+          require_parameters: true,
+        },
       }),
     })
 

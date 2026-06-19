@@ -73,7 +73,8 @@ export async function callOpenRouter(request: ChatRequest) {
         throw lastError
       }
 
-      await sleep(700 * attempt, request.signal)
+      const jitter = Math.random() * 800
+      await sleep(1000 * attempt + jitter, request.signal)
     }
   }
 
